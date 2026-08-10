@@ -14,7 +14,6 @@ export const logger = pino({
           },
         }
       : undefined,
-  base: { service: 'api', env: env.NODE_ENV },
   redact: {
     paths: ['req.headers.authorization', 'req.headers.cookie', '*.password', '*.passwordHash'],
     censor: '[REDACTED]',
