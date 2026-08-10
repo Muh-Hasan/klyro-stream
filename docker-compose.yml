@@ -1,15 +1,16 @@
 services:
   postgres:
-    image: postgres:18
+    image: postgres:17
     restart: unless-stopped
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: pwd
+      POSTGRES_USER: klyro
+      POSTGRES_PASSWORD: klyro_dev_pw
       POSTGRES_DB: klyrostream
     ports:
-      - '5432:5432'
+      # host 5433 -> container 5432: a native Windows postgres service owns host 5432
+      - '5433:5432'
     volumes:
-      - postgres_data:/var/lib/postgresql
+      - postgres_data:/var/lib/postgresql/data
   redis:
     image: redis:8-alpine
     restart: unless-stopped
