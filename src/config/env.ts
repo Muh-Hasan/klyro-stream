@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { z } from 'zod';
+import type { StringValue } from 'ms';
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -9,8 +10,15 @@ const envSchema = z.object({
   REDIS_URL: z.string().url().optional(),
 
   JWT_SECRET: z.string().min(32),
-  JWT_ACCESS_TTL: z.string().default('15m'),
-  JWT_REFRESH_TTL: z.string().default('7d'),
+  JWT_ACCESS_TTL: z
+    .string()
+    .default('15m')
+    .transform((value) => value as StringValue),
+
+  JWT_REFRESH_TTL: z
+    .string()
+    .default('7d')
+    .transform((value) => value as StringValue),
 
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 });

@@ -19,3 +19,6 @@ export const users = pgTable('users', {
   providerId: text('provider_id'), // google sub claim, null for local
   ...timestamps,
 });
+
+export type User = typeof users.$inferSelect;
+export type NewUser = typeof users.$inferInsert;
