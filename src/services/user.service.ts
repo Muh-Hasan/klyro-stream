@@ -22,3 +22,7 @@ export const create = async (data: NewUser) => {
   const [user] = await db.insert(users).values(data).returning();
   return user;
 };
+
+export const updatePassword = async (id: string, passwordHash: string) => {
+  await db.update(users).set({ passwordHash }).where(eq(users.id, id));
+};

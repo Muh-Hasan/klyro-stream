@@ -11,3 +11,4 @@ export const login = async (req: Request, res: Response) => {
   const result = await authService.loginUser(req.body as LoginSchemaType);
   res.json(result);
 };
+

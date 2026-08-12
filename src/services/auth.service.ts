@@ -36,3 +36,4 @@ export const loginUser = async (input: { email: string; password: string }) => {
     accessToken,
   };
 };
+

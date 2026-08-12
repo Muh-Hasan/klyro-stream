@@ -24,5 +24,26 @@ export const LoginSchema = z.object({
     .nonempty({ error: 'This field is required' }),
 });
 
-export type LoginSchemaType = z.infer<typeof LoginSchema>
-export type RegisterSchemaType = z.infer<typeof RegisterSchema>
+export const ForgotPasswordSchema = z.object({
+  email: z.email({ error: 'Invalid email address' }),
+});
+
+export const ResetPasswordSchema = z.object({
+  token: z.string().min(1),
+  password: z
+    .string({ error: 'This field is required' })
+    .min(8, { error: 'Password must be at least 8 characters long' })
+    .refine((val) => /[A-Z]/.test(val), {
+      error: 'Password must contain at least one uppercase letter',
+    })
+    .refine((val) => /[a-z]/.test(val), {
+      error: 'Password must contain at least one lowercase letter',
+    })
+    .refine((val) => /\d/.test(val), { error: 'Password must contain at least one number' })
+    .refine((val) => /[@$!%*?&]/.test(val), {
+      error: 'Password must contain at least one special character (@$!%*?&)',
+    }),
+});
+
+export type LoginSchemaType = z.infer<typeof LoginSchema>;
+export type RegisterSchemaType = z.infer<typeof RegisterSchema>;
