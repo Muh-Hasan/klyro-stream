@@ -18,5 +18,11 @@ docs {
 script:post-response {
   if (res.status === 200) {
     bru.setVar("accessToken", res.getBody().accessToken);
+    // Keep the old refresh token so "Refresh (replay)" can send it again.
+    const setCookie = [].concat(res.getHeader("set-cookie") || []).find((c) => c.startsWith("rt="));
+    if (setCookie) {
+      bru.setVar("previousRefreshToken", bru.getVar("currentRefreshToken"));
+      bru.setVar("currentRefreshToken", setCookie.split(";")[0].slice(3));
+    }
   }
 }

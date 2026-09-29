@@ -9,6 +9,8 @@ import { logger } from '../../utils/logger.js';
 export const redis = new Redis(env.REDIS_URL, {
   lazyConnect: true, // connect on the first command, not at import time (keeps scripts clean)
   maxRetriesPerRequest: 3,
+  // Fail a command if Redis doesn't reply in time; otherwise a dead connection hangs the request.
+  commandTimeout: 2000,
   enableOfflineQueue: true,
 });
 

@@ -1,0 +1,15 @@
+meta {
+  name: Logout all
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{baseUrl}}/auth/logout-all
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}

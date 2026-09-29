@@ -33,7 +33,14 @@ export const refresh: RequestHandler = async (req, res) => {
   res.json(result);
 };
 
-export const logout: RequestHandler = (_req, res) => {
+export const logout: RequestHandler = async (req, res) => {
+  await authService.logoutSession(getRefreshCookie(req));
+  clearRefreshCookie(res);
+  res.status(204).end();
+};
+
+export const logoutAll: RequestHandler = async (req, res) => {
+  await authService.logoutAllSessions(currentUser(req).id);
   clearRefreshCookie(res);
   res.status(204).end();
 };

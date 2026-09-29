@@ -11,3 +11,4 @@ authRouter.post('/login', validate(loginSchemas), authController.login);
 authRouter.get('/me', requireAuth, authController.me);
 authRouter.post('/refresh', authController.refresh);
 authRouter.post('/logout', authController.logout);
+authRouter.post('/logout-all', requireAuth, authController.logoutAll);

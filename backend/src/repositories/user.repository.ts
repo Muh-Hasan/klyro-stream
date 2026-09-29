@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { db } from '../lib/db/client.js';
 import { users } from '../lib/db/schema.js';
 
@@ -13,6 +13,13 @@ export const findByEmail = async (email: string): Promise<User | undefined> => {
 export const findById = async (id: string): Promise<User | undefined> => {
   const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
   return user;
+};
+
+export const bumpTokenVersion = async (id: string): Promise<void> => {
+  await db
+    .update(users)
+    .set({ tokenVersion: sql`${users.tokenVersion} + 1` })
+    .where(eq(users.id, id));
 };
 
 export const create = async (data: NewUser): Promise<User> => {

@@ -1,0 +1,20 @@
+meta {
+  name: Refresh (replay)
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/auth/refresh
+  body: none
+  auth: none
+}
+
+headers {
+  Cookie: rt={{previousRefreshToken}}
+}
+
+docs {
+  Sends the refresh token from before the last Refresh, which is now blacklisted.
+  Run Login, then Refresh, then this. Expected: 401 TOKEN_REUSED.
+}
