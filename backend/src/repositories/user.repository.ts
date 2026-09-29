@@ -10,6 +10,11 @@ export const findByEmail = async (email: string): Promise<User | undefined> => {
   return user;
 };
 
+export const findById = async (id: string): Promise<User | undefined> => {
+  const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return user;
+};
+
 export const create = async (data: NewUser): Promise<User> => {
   const [user] = await db.insert(users).values(data).returning();
   if (!user) throw new Error('insert into users returned no row');

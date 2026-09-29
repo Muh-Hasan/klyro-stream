@@ -3,7 +3,7 @@ import * as userRepo from '../repositories/user.repository.js';
 import type { User } from '../repositories/user.repository.js';
 import { isUniqueViolation } from '../utils/db-errors.js';
 import { ConflictError, UnauthorizedError } from '../utils/errors.js';
-import { signAccessToken } from '../utils/tokens.js';
+import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/tokens.js';
 import type { LoginInput, RegisterInput } from '../validators/auth.schema.js';
 
 const BCRYPT_COST = 10;
@@ -38,5 +38,31 @@ export const loginUser = async ({ email, password }: LoginInput) => {
   return {
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
     accessToken: signAccessToken(user.id),
+    refreshToken: signRefreshToken(user.id),
+  };
+};
+
+export const getMe = async (userId: string) => {
+  const user = await userRepo.findById(userId);
+
+  if (!user) throw new UnauthorizedError();
+
+  return { user: { id: user.id, email: user.email, createdAt: user.createdAt } };
+};
+
+export const refreshSession = async (refreshToken: string) => {
+  let userId: string;
+  try {
+    userId = verifyRefreshToken(refreshToken);
+  } catch {
+    throw new UnauthorizedError('Invalid or expired refresh token', 'INVALID_TOKEN');
+  }
+
+  const user = await userRepo.findById(userId);
+  if (!user) throw new UnauthorizedError('Invalid or expired refresh token', 'INVALID_TOKEN');
+
+  return {
+    accessToken: signAccessToken(user.id),
+    refreshToken: signRefreshToken(user.id),
   };
 };

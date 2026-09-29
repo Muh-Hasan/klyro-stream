@@ -1,0 +1,22 @@
+meta {
+  name: Refresh
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/auth/refresh
+  body: none
+  auth: none
+}
+
+docs {
+  Sends the `rt` cookie that Login set (Bruno's cookie jar does this automatically).
+  Returns a new access token and replaces the `rt` cookie.
+}
+
+script:post-response {
+  if (res.status === 200) {
+    bru.setVar("accessToken", res.getBody().accessToken);
+  }
+}
