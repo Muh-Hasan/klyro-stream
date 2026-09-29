@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import jwt, { type JwtPayload } from 'jsonwebtoken';
 import { env } from '../config/env.js';
 
@@ -33,3 +33,8 @@ export const verifyRefreshToken = (token: string): RefreshPayload => {
   if (!jti || !exp || typeof ver !== 'number') throw new Error('Malformed token');
   return { userId: sub, jti, exp, ver };
 };
+
+export const generateResetToken = (): string => randomBytes(32).toString('base64url');
+
+export const hashToken = (token: string): string =>
+  createHash('sha256').update(token).digest('hex');

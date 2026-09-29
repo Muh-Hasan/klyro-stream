@@ -23,6 +23,11 @@ const schema = z.object({
   JWT_REFRESH_SECRET: z.string().min(32),
 
   FRONTEND_URL: csv.pipe(z.array(z.url()).min(1)),
+
+  SMTP_HOST: z.string().default('localhost'),
+  SMTP_PORT: z.coerce.number().int().positive().default(1025),
+  MAIL_FROM: z.string().default('KlyroStream <no-reply@klyro.local>'),
+  PASSWORD_RESET_URL: z.url(),
 });
 
 const parsed = schema.safeParse(process.env);

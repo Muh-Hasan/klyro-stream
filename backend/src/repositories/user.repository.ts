@@ -22,6 +22,13 @@ export const bumpTokenVersion = async (id: string): Promise<void> => {
     .where(eq(users.id, id));
 };
 
+export const updatePassword = async (id: string, passwordHash: string): Promise<void> => {
+  await db
+    .update(users)
+    .set({ passwordHash, tokenVersion: sql`${users.tokenVersion} + 1` })
+    .where(eq(users.id, id));
+};
+
 export const create = async (data: NewUser): Promise<User> => {
   const [user] = await db.insert(users).values(data).returning();
   if (!user) throw new Error('insert into users returned no row');

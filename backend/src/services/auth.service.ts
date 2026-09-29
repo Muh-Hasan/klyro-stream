@@ -1,16 +1,27 @@
 import bcrypt from 'bcrypt';
+import { env } from '../config/env.js';
+import { sendMail } from '../lib/mail/mailer.js';
+import * as passwordReset from '../repositories/password-reset.repository.js';
 import * as tokenBlacklist from '../repositories/token-blacklist.repository.js';
 import * as userRepo from '../repositories/user.repository.js';
 import type { User } from '../repositories/user.repository.js';
 import { isUniqueViolation } from '../utils/db-errors.js';
 import { ConflictError, UnauthorizedError } from '../utils/errors.js';
+import { logger } from '../utils/logger.js';
 import {
+  generateResetToken,
+  hashToken,
   type RefreshPayload,
   signAccessToken,
   signRefreshToken,
   verifyRefreshToken,
 } from '../utils/tokens.js';
-import type { LoginInput, RegisterInput } from '../validators/auth.schema.js';
+import type {
+  ForgotPasswordInput,
+  LoginInput,
+  RegisterInput,
+  ResetPasswordInput,
+} from '../validators/auth.schema.js';
 
 const BCRYPT_COST = 10;
 
@@ -97,4 +108,27 @@ export const logoutSession = async (refreshToken: string | undefined) => {
 
 export const logoutAllSessions = async (userId: string) => {
   await userRepo.bumpTokenVersion(userId);
+};
+
+export const forgotPassword = async ({ email }: ForgotPasswordInput) => {
+  const user = await userRepo.findByEmail(email);
+  if (!user?.passwordHash) return;
+
+  const token = generateResetToken();
+  await passwordReset.save(hashToken(token), user.id);
+
+  const link = `${env.PASSWORD_RESET_URL}?token=${token}`;
+  void sendMail({
+    to: user.email,
+    subject: 'Reset your KlyroStream password',
+    text: `Reset your password using this link (valid for 30 minutes):\n\n${link}\n\nIf you didn't ask for this, ignore this email.`,
+  }).catch((err: unknown) => logger.error({ err, userId: user.id }, 'reset email failed'));
+};
+
+export const resetPassword = async ({ token, password }: ResetPasswordInput) => {
+  const userId = await passwordReset.consume(hashToken(token));
+  if (!userId) throw new UnauthorizedError('Invalid or expired reset token', 'INVALID_RESET_TOKEN');
+
+  const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
+  await userRepo.updatePassword(userId, passwordHash);
 };

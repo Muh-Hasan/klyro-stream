@@ -10,6 +10,7 @@ import type { Server } from 'node:http';
 import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { closeDb } from './lib/db/client.js';
+import { closeMailer } from './lib/mail/mailer.js';
 import { closeRedis } from './lib/redis/client.js';
 import { logger } from './utils/logger.js';
 
@@ -37,6 +38,7 @@ const shutdown = async (reason: string, exitCode = 0) => {
     server.closeIdleConnections(); // drop idle keep-alive sockets now; busy ones finish first
   });
 
+  closeMailer();
   const results = await Promise.allSettled([closeDb(), closeRedis()]);
   for (const result of results) {
     if (result.status === 'rejected') logger.error({ err: result.reason }, 'error during shutdown');
