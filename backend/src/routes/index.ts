@@ -4,13 +4,14 @@
  */
 import { Router } from 'express';
 import { authRouter } from './auth.routes.js';
+import { clubsRouter } from './clubs.routes.js';
 import { healthRouter } from './health.routes.js';
 
 export const routes = Router();
 
 routes.use('/health', healthRouter);
 routes.use('/auth', authRouter);
+routes.use('/clubs', clubsRouter);
 
 // Add feature routers as they are built:
-// routes.use('/clubs', clubsRouter);    // Sprint 3
 // routes.use('/videos', videosRouter);  // Sprint 4

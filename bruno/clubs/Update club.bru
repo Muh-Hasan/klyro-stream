@@ -1,0 +1,21 @@
+meta {
+  name: Update club
+  type: http
+  seq: 4
+}
+
+patch {
+  url: {{baseUrl}}/clubs/{{clubId}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "name": "Chess Club Pro"
+  }
+}
