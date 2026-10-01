@@ -4,7 +4,7 @@
  *   npm run db:migrate    -> applies it
  * Never edit a migration that has already been applied; generate a new one.
  */
-import { relations } from 'drizzle-orm';
+import { relations, sql } from 'drizzle-orm';
 import {
   bigint,
   index,
@@ -27,6 +27,13 @@ export const videoStatusEnum = pgEnum('video_status', [
   'PROCESSING',
   'READY',
   'ERROR',
+]);
+export const invitationStatusEnum = pgEnum('invitation_status', [
+  'pending',
+  'accepted',
+  'rejected',
+  'revoked',
+  'expired',
 ]);
 
 // ─── Shared columns ─────────────────────────────────────────────────────
@@ -86,6 +93,34 @@ export const clubMembers = pgTable(
   (t) => [
     primaryKey({ columns: [t.userId, t.clubId] }),
     index('club_members_club_idx').on(t.clubId),
+  ],
+);
+
+// ─── club_invitations ───────────────────────────────────────────────────
+export const clubInvitations = pgTable(
+  'club_invitations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    clubId: uuid('club_id')
+      .notNull()
+      .references(() => clubs.id, { onDelete: 'cascade' }),
+    email: varchar('email', { length: 320 }).notNull(),
+    role: userRoleEnum('role').notNull(),
+    invitedBy: uuid('invited_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    tokenHash: text('token_hash').notNull(),
+    status: invitationStatusEnum('status').notNull().default('pending'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    respondedAt: timestamp('responded_at', { withTimezone: true }),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex('club_invitations_token_uniq').on(t.tokenHash),
+    uniqueIndex('club_invitations_pending_uniq')
+      .on(t.clubId, t.email)
+      .where(sql`${t.status} = 'pending'`),
+    index('club_invitations_email_idx').on(t.email),
   ],
 );
 
@@ -184,3 +219,5 @@ export type NewVideo = typeof videos.$inferInsert;
 export type VideoStatus = (typeof videoStatusEnum.enumValues)[number];
 export type DownloadQuota = typeof downloadQuotas.$inferSelect;
 export type DownloadLog = typeof downloadLogs.$inferSelect;
+export type ClubInvitation = typeof clubInvitations.$inferSelect;
+export type InvitationStatus = (typeof invitationStatusEnum.enumValues)[number];

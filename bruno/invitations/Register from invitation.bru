@@ -1,0 +1,22 @@
+meta {
+  name: Register from invitation
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/invitations/register
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "token": "{{inviteToken}}",
+    "password": "Password123"
+  }
+}
+
+script:post-response {
+  if (res.status === 201) bru.setVar("accessToken", res.getBody().accessToken);
+}

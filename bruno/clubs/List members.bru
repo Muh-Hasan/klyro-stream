@@ -1,0 +1,15 @@
+meta {
+  name: List members
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/clubs/{{clubId}}/members
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}

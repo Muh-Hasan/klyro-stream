@@ -1,4 +1,3 @@
-import bcrypt from 'bcrypt';
 import { env } from '../config/env.js';
 import { sendMail } from '../lib/mail/mailer.js';
 import * as passwordReset from '../repositories/password-reset.repository.js';
@@ -8,8 +7,9 @@ import type { User } from '../repositories/user.repository.js';
 import { isUniqueViolation } from '../utils/db-errors.js';
 import { ConflictError, UnauthorizedError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
+import { hashPassword, verifyPassword } from '../utils/password.js';
 import {
-  generateResetToken,
+  generateToken,
   hashToken,
   type RefreshPayload,
   signAccessToken,
@@ -23,13 +23,11 @@ import type {
   ResetPasswordInput,
 } from '../validators/auth.schema.js';
 
-const BCRYPT_COST = 10;
-
 export const registerUser = async ({ email, password }: RegisterInput) => {
   if (await userRepo.findByEmail(email))
     throw new ConflictError('Email is already registered', 'EMAIL_TAKEN');
 
-  const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
+  const passwordHash = await hashPassword(password);
 
   let user: User;
   try {
@@ -48,7 +46,7 @@ export const registerUser = async ({ email, password }: RegisterInput) => {
 export const loginUser = async ({ email, password }: LoginInput) => {
   const user = await userRepo.findByEmail(email);
 
-  if (!user?.passwordHash || !(await bcrypt.compare(password, user.passwordHash))) {
+  if (!user?.passwordHash || !(await verifyPassword(password, user.passwordHash))) {
     throw new UnauthorizedError('Invalid email or password', 'INVALID_CREDENTIALS');
   }
 
@@ -114,7 +112,7 @@ export const forgotPassword = async ({ email }: ForgotPasswordInput) => {
   const user = await userRepo.findByEmail(email);
   if (!user?.passwordHash) return;
 
-  const token = generateResetToken();
+  const token = generateToken();
   await passwordReset.save(hashToken(token), user.id);
 
   const link = `${env.PASSWORD_RESET_URL}?token=${token}`;
@@ -129,6 +127,6 @@ export const resetPassword = async ({ token, password }: ResetPasswordInput) => 
   const userId = await passwordReset.consume(hashToken(token));
   if (!userId) throw new UnauthorizedError('Invalid or expired reset token', 'INVALID_RESET_TOKEN');
 
-  const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
+  const passwordHash = await hashPassword(password);
   await userRepo.updatePassword(userId, passwordHash);
 };

@@ -28,6 +28,7 @@ const schema = z.object({
   SMTP_PORT: z.coerce.number().int().positive().default(1025),
   MAIL_FROM: z.string().default('KlyroStream <no-reply@klyro.local>'),
   PASSWORD_RESET_URL: z.url(),
+  INVITE_URL: z.url(),
 });
 
 const parsed = schema.safeParse(process.env);

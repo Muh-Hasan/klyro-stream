@@ -1,16 +1,8 @@
 import { and, count, desc, eq } from 'drizzle-orm';
 import { db } from '../lib/db/client.js';
-import { clubMembers, clubs, downloadQuotas } from '../lib/db/schema.js';
+import { type ClubRole, clubMembers, clubs, downloadQuotas } from '../lib/db/schema.js';
 
 export type Club = typeof clubs.$inferSelect;
-
-const clubWithRole = {
-  id: clubs.id,
-  name: clubs.name,
-  ownerId: clubs.ownerId,
-  createdAt: clubs.createdAt,
-  role: clubMembers.role,
-};
 
 export const createWithOwner = (name: string, ownerId: string): Promise<Club> =>
   db.transaction(async (tx) => {
@@ -21,15 +13,38 @@ export const createWithOwner = (name: string, ownerId: string): Promise<Club> =>
     return club;
   });
 
+export const findById = async (clubId: string): Promise<Club | undefined> => {
+  const [club] = await db.select().from(clubs).where(eq(clubs.id, clubId)).limit(1);
+  return club;
+};
+
 export const updateName = async (clubId: string, name: string): Promise<Club | undefined> => {
   const [club] = await db.update(clubs).set({ name }).where(eq(clubs.id, clubId)).returning();
   return club;
 };
 
+export const getMemberRole = async (
+  clubId: string,
+  userId: string,
+): Promise<ClubRole | undefined> => {
+  const [member] = await db
+    .select({ role: clubMembers.role })
+    .from(clubMembers)
+    .where(and(eq(clubMembers.clubId, clubId), eq(clubMembers.userId, userId)))
+    .limit(1);
+  return member?.role;
+};
+
 export const listForUser = async (userId: string, limit: number, offset: number) => {
   const [items, [total]] = await Promise.all([
     db
-      .select(clubWithRole)
+      .select({
+        id: clubs.id,
+        name: clubs.name,
+        ownerId: clubs.ownerId,
+        createdAt: clubs.createdAt,
+        role: clubMembers.role,
+      })
       .from(clubMembers)
       .innerJoin(clubs, eq(clubs.id, clubMembers.clubId))
       .where(eq(clubMembers.userId, userId))
@@ -39,14 +54,4 @@ export const listForUser = async (userId: string, limit: number, offset: number)
     db.select({ value: count() }).from(clubMembers).where(eq(clubMembers.userId, userId)),
   ]);
   return { items, total: total?.value ?? 0 };
-};
-
-export const findForMember = async (clubId: string, userId: string) => {
-  const [club] = await db
-    .select(clubWithRole)
-    .from(clubMembers)
-    .innerJoin(clubs, eq(clubs.id, clubMembers.clubId))
-    .where(and(eq(clubMembers.clubId, clubId), eq(clubMembers.userId, userId)))
-    .limit(1);
-  return club;
 };

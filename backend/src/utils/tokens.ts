@@ -34,7 +34,7 @@ export const verifyRefreshToken = (token: string): RefreshPayload => {
   return { userId: sub, jti, exp, ver };
 };
 
-export const generateResetToken = (): string => randomBytes(32).toString('base64url');
+export const generateToken = (): string => randomBytes(32).toString('base64url');
 
 export const hashToken = (token: string): string =>
   createHash('sha256').update(token).digest('hex');

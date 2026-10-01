@@ -1,0 +1,26 @@
+meta {
+  name: Invite member
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/clubs/{{clubId}}/invitations
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "email": "friend@example.com",
+    "role": "viewer"
+  }
+}
+
+script:post-response {
+  if (res.status === 201) bru.setVar("invitationId", res.getBody().invitation.id);
+}

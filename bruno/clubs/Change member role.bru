@@ -1,0 +1,21 @@
+meta {
+  name: Change member role
+  type: http
+  seq: 9
+}
+
+patch {
+  url: {{baseUrl}}/clubs/{{clubId}}/members/{{memberId}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "role": "club_owner"
+  }
+}

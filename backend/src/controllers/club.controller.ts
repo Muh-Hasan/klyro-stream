@@ -1,10 +1,10 @@
 import type { RequestHandler } from 'express';
 import { getInput } from '../middleware/validate.middleware.js';
 import * as clubService from '../services/club.service.js';
+import { currentMembership } from '../utils/current-membership.js';
 import { currentUser } from '../utils/current-user.js';
 import type {
   createClubSchemas,
-  getClubSchemas,
   listClubsSchemas,
   updateClubSchemas,
 } from '../validators/club.schema.js';
@@ -21,14 +21,13 @@ export const list: RequestHandler = async (req, res) => {
   res.json(result);
 };
 
-export const get: RequestHandler = async (req, res) => {
-  const { params } = getInput<typeof getClubSchemas>(res);
-  const result = await clubService.getClub(currentUser(req).id, params.clubId);
+export const get: RequestHandler = async (_req, res) => {
+  const result = await clubService.getClub(currentMembership(res));
   res.json(result);
 };
 
-export const update: RequestHandler = async (req, res) => {
-  const { params, body } = getInput<typeof updateClubSchemas>(res);
-  const result = await clubService.updateClub(currentUser(req).id, params.clubId, body);
+export const update: RequestHandler = async (_req, res) => {
+  const { body } = getInput<typeof updateClubSchemas>(res);
+  const result = await clubService.updateClub(currentMembership(res), body);
   res.json(result);
 };

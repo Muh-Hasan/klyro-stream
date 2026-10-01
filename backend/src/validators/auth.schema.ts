@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-const email = z
+export const email = z
   .email({
     error: (issue) =>
       issue.input === undefined
@@ -13,7 +13,7 @@ const email = z
 const passwordRequired = (issue: { input?: unknown }) =>
   issue.input === undefined ? 'The password is required.' : 'The password must be a string.';
 
-const newPassword = z
+export const newPassword = z
   .string({ error: passwordRequired })
   .min(8, 'The password must be at least 8 characters.')
   .max(72, 'The password must be at most 72 characters.')
@@ -39,14 +39,13 @@ export const forgotPasswordSchemas = {
   body: z.object({ email }),
 };
 
+export const token = z
+  .string({ error: 'The token is required.' })
+  .min(1, 'The token is required.')
+  .max(100, 'The token is invalid.');
+
 export const resetPasswordSchemas = {
-  body: z.object({
-    token: z
-      .string({ error: 'The token is required.' })
-      .min(1, 'The token is required.')
-      .max(100, 'The token is invalid.'),
-    password: newPassword,
-  }),
+  body: z.object({ token, password: newPassword }),
 };
 
 export type RegisterInput = z.output<typeof registerSchemas.body>;

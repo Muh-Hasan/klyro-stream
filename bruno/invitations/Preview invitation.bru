@@ -1,0 +1,17 @@
+meta {
+  name: Preview invitation
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/invitations/preview
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "token": "{{inviteToken}}"
+  }
+}

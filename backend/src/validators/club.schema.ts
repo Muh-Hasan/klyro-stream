@@ -1,8 +1,13 @@
 import { z } from 'zod';
+import { userRoleEnum } from '../lib/db/schema.js';
 import { paginationQuery } from './common.schema.js';
 
-const clubParams = z.object({
+export const clubParams = z.object({
   clubId: z.uuid({ error: 'The club id must be a valid UUID.' }),
+});
+
+export const clubRole = z.enum(userRoleEnum.enumValues, {
+  error: `The role must be one of: ${userRoleEnum.enumValues.join(', ')}.`,
 });
 
 const name = z
