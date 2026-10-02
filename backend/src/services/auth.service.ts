@@ -130,3 +130,37 @@ export const resetPassword = async ({ token, password }: ResetPasswordInput) => 
   const passwordHash = await hashPassword(password);
   await userRepo.updatePassword(userId, passwordHash);
 };
+
+type GoogleIdentity = { sub: string; email: string | undefined; emailVerified: boolean };
+export type GoogleSignInResult =
+  { user: User } | { error: 'email_not_verified' | 'use_password' | 'account_exists' };
+
+const conflictFor = (existing: User) =>
+  ({ error: existing.provider === 'local' ? 'use_password' : 'account_exists' }) as const;
+
+export const signInWithGoogle = async ({
+  sub,
+  email,
+  emailVerified,
+}: GoogleIdentity): Promise<GoogleSignInResult> => {
+  const linked = await userRepo.findByProvider('google', sub);
+  if (linked) return { user: linked };
+
+  if (!email || !emailVerified) return { error: 'email_not_verified' };
+  const normalized = email.toLowerCase();
+
+  const existing = await userRepo.findByEmail(normalized);
+  if (existing) return conflictFor(existing);
+
+  try {
+    return {
+      user: await userRepo.create({ email: normalized, provider: 'google', providerId: sub }),
+    };
+  } catch (err) {
+    if (!isUniqueViolation(err)) throw err;
+    const raced =
+      (await userRepo.findByProvider('google', sub)) ?? (await userRepo.findByEmail(normalized));
+    if (!raced) throw err;
+    return raced.providerId === sub ? { user: raced } : conflictFor(raced);
+  }
+};

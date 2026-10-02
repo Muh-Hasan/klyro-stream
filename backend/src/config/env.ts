@@ -29,6 +29,11 @@ const schema = z.object({
   MAIL_FROM: z.string().default('KlyroStream <no-reply@klyro.local>'),
   PASSWORD_RESET_URL: z.url(),
   INVITE_URL: z.url(),
+
+  GOOGLE_CLIENT_ID: z.string().min(1),
+  GOOGLE_CLIENT_SECRET: z.string().min(1),
+  GOOGLE_CALLBACK_URL: z.url(),
+  OAUTH_SUCCESS_REDIRECT: z.url(),
 });
 
 const parsed = schema.safeParse(process.env);

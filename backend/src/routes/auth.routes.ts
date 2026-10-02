@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import * as authController from '../controllers/auth.controller.js';
+import { googleAuthCallback, googleAuthStart } from '../middleware/google-auth.middleware.js';
 import {
   forgotPasswordLimiter,
   loginLimiter,
@@ -35,3 +36,5 @@ authRouter.post(
   validate(resetPasswordSchemas),
   authController.resetPassword,
 );
+authRouter.get('/google', googleAuthStart);
+authRouter.get('/google/callback', googleAuthCallback);

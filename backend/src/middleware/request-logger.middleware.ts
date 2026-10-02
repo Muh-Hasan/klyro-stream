@@ -10,6 +10,9 @@ import { logger } from '../utils/logger.js';
 
 const HEADER = 'x-request-id';
 const QUIET_PATHS = new Set(['/health']);
+const NO_QUERY_PATHS = new Set(['/auth/google/callback']);
+
+const pathOf = (url: string | undefined) => url?.split('?')[0] ?? '';
 
 export const requestLogger = pinoHttp({
   logger,
@@ -19,7 +22,7 @@ export const requestLogger = pinoHttp({
     res.setHeader('X-Request-Id', id);
     return id;
   },
-  autoLogging: { ignore: (req) => QUIET_PATHS.has(req.url?.split('?')[0] ?? '') },
+  autoLogging: { ignore: (req) => QUIET_PATHS.has(pathOf(req.url)) },
   customLogLevel: (_req, res, err) => {
     if (err || res.statusCode >= 500) return 'error';
     if (res.statusCode >= 400) return 'warn';
@@ -30,7 +33,7 @@ export const requestLogger = pinoHttp({
     req: (req: { id: unknown; method: string; url: string }) => ({
       id: req.id,
       method: req.method,
-      url: req.url,
+      url: NO_QUERY_PATHS.has(pathOf(req.url)) ? pathOf(req.url) : req.url,
     }),
     res: (res: { statusCode: number }) => ({ statusCode: res.statusCode }),
   },

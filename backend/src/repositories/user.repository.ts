@@ -1,4 +1,4 @@
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../lib/db/client.js';
 import { users } from '../lib/db/schema.js';
 
@@ -12,6 +12,18 @@ export const findByEmail = async (email: string): Promise<User | undefined> => {
 
 export const findById = async (id: string): Promise<User | undefined> => {
   const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return user;
+};
+
+export const findByProvider = async (
+  provider: User['provider'],
+  providerId: string,
+): Promise<User | undefined> => {
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(and(eq(users.provider, provider), eq(users.providerId, providerId)))
+    .limit(1);
   return user;
 };
 
