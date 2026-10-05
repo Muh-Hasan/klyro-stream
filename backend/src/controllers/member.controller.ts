@@ -28,6 +28,6 @@ export const remove: RequestHandler = async (_req, res) => {
 };
 
 export const leave: RequestHandler = async (req, res) => {
-  await memberService.removeMember(currentMembership(res), currentUser(req).id);
+  await memberService.leaveClub(currentMembership(res), currentUser(req).id);
   res.status(204).end();
 };
