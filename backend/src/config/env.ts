@@ -34,6 +34,12 @@ const schema = z.object({
   GOOGLE_CLIENT_SECRET: z.string().min(1),
   GOOGLE_CALLBACK_URL: z.url(),
   OAUTH_SUCCESS_REDIRECT: z.url(),
+
+  S3_ENDPOINT: z.url(),
+  S3_PUBLIC_ENDPOINT: z.url(),
+  S3_REGION: z.string().default('us-east-1'),
+  S3_ACCESS_KEY: z.string().min(1),
+  S3_SECRET_KEY: z.string().min(1),
 });
 
 const parsed = schema.safeParse(process.env);

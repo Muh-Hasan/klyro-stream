@@ -33,6 +33,22 @@ services:
     restart: unless-stopped
     ports: ['1025:1025', '8025:8025']
 
+  rustfs:
+    image: rustfs/rustfs:1.0.1
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: klyro
+      RUSTFS_SECRET_KEY: klyro_dev_storage
+      RUSTFS_CONSOLE_ENABLE: 'true'
+    ports: ['9000:9000', '9001:9001']
+    volumes: [rustfs_data:/data]
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:9000/health']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   postgres_data:
   redis_data:
+  rustfs_data:

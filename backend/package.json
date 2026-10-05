@@ -18,9 +18,12 @@
     "check": "npm run typecheck && npm run lint && npm run format:check",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "storage:init": "tsx src/scripts/storage-init.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1146.0",
+    "@aws-sdk/s3-request-presigner": "^3.1146.0",
     "bcrypt": "^6.0.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
