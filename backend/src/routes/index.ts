@@ -7,6 +7,7 @@ import { authRouter } from './auth.routes.js';
 import { clubsRouter } from './clubs.routes.js';
 import { healthRouter } from './health.routes.js';
 import { invitationsRouter } from './invitations.routes.js';
+import { videosRouter } from './videos.routes.js';
 
 export const routes = Router();
 
@@ -14,6 +15,4 @@ routes.use('/health', healthRouter);
 routes.use('/auth', authRouter);
 routes.use('/clubs', clubsRouter);
 routes.use('/invitations', invitationsRouter);
-
-// Add feature routers as they are built:
-// routes.use('/videos', videosRouter);  // Sprint 4
+routes.use('/videos', videosRouter);

@@ -139,6 +139,7 @@ export const videos = pgTable(
     description: text('description'),
     status: videoStatusEnum('status').notNull().default('UPLOADING'),
     rawPath: text('raw_path'),
+    uploadId: text('upload_id'),
     hlsPath: text('hls_path'),
     thumbnailPath: text('thumbnail_path'),
     durationSeconds: integer('duration_seconds'),
@@ -147,7 +148,6 @@ export const videos = pgTable(
     ...timestamps,
   },
   (t) => [
-    index('videos_club_idx').on(t.clubId),
     index('videos_status_idx').on(t.status),
     index('videos_club_created_idx').on(t.clubId, t.createdAt),
   ],

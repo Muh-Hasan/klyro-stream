@@ -2,6 +2,7 @@ import { Router } from 'express';
 import * as clubController from '../controllers/club.controller.js';
 import * as invitationController from '../controllers/invitation.controller.js';
 import * as memberController from '../controllers/member.controller.js';
+import * as videoController from '../controllers/video.controller.js';
 import { requireAuth } from '../middleware/require-auth.middleware.js';
 import { requireClubRole } from '../middleware/require-club-role.middleware.js';
 import { validate } from '../middleware/validate.middleware.js';
@@ -22,6 +23,7 @@ import {
   removeMemberSchemas,
   updateMemberSchemas,
 } from '../validators/member.schema.js';
+import { initiateUploadSchemas } from '../validators/video.schema.js';
 
 export const clubsRouter = Router();
 
@@ -84,4 +86,11 @@ clubsRouter.post(
   validate(leaveClubSchemas),
   requireClubRole('viewer'),
   memberController.leave,
+);
+
+clubsRouter.post(
+  '/:clubId/videos/uploads',
+  validate(initiateUploadSchemas),
+  requireClubRole('club_owner'),
+  videoController.initiateUpload,
 );
