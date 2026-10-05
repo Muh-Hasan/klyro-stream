@@ -19,7 +19,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
-    "storage:init": "tsx src/scripts/storage-init.ts"
+    "storage:init": "tsx src/scripts/storage-init.ts",
+    "upload": "tsx src/scripts/upload.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1146.0",

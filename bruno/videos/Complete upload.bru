@@ -1,0 +1,30 @@
+meta {
+  name: Complete upload
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/videos/{{videoId}}/upload/complete
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "parts": {{uploadedParts}}
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq PROCESSING
+}
+
+docs {
+  Hands the receipts back; storage stitches the parts, the API checks the size and moves the video to PROCESSING.
+}

@@ -1,0 +1,43 @@
+meta {
+  name: Presign parts
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/videos/{{videoId}}/upload/parts
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "partNumbers": [1]
+  }
+}
+
+script:pre-request {
+  const count = Number(bru.getVar('partCount'));
+  req.setBody({ partNumbers: Array.from({ length: count }, (_, i) => i + 1) });
+}
+
+script:post-response {
+  if (res.status === 200) {
+    bru.setVar('partUrls', JSON.stringify(res.getBody().parts));
+    bru.setVar('partIndex', 0);
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.parts.length: gt 0
+}
+
+docs {
+  Signs one PUT URL per part (all of them; the API allows up to 100 per request). The URLs go straight to RustFS.
+  Saves partUrls and resets partIndex for Upload part.
+}

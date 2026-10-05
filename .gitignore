@@ -8,3 +8,6 @@ coverage
 .DS_Store
 Thumbs.db
 .vscode
+
+# local test videos for Bruno and the upload lab (too large to commit)
+/bruno/videos/fixtures/*.mp4

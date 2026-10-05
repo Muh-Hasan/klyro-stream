@@ -1,0 +1,32 @@
+meta {
+  name: Upload progress
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/videos/{{videoId}}/upload/parts
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+script:post-response {
+  if (res.status === 200) {
+    const parts = res.getBody().uploaded.map((p) => ({ partNumber: p.partNumber, etag: p.etag }));
+    bru.setVar("uploadedParts", JSON.stringify(parts));
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.missing.length: eq 0
+}
+
+docs {
+  What storage already holds (ListParts) and which parts are missing. This is how a client resumes.
+  Saves the receipts as uploadedParts for Complete upload.
+}

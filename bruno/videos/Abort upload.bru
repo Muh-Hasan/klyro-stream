@@ -1,0 +1,20 @@
+meta {
+  name: Abort upload
+  type: http
+  seq: 6
+}
+
+delete {
+  url: {{baseUrl}}/videos/{{videoId}}/upload
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+docs {
+  Use instead of Complete upload: deletes the stored parts and moves the video to ERROR (204).
+  In a full collection run it comes after Complete, so it returns 409 UPLOAD_NOT_IN_PROGRESS. That is expected.
+}

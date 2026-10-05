@@ -1,6 +1,6 @@
 # Database indexes (PostgreSQL)
 
-How indexes work, and every index KlyroStream uses, tied to real code and measured with `EXPLAIN ANALYZE`. See also [locking.md](locking.md) for how concurrent writes stay correct.
+How indexes work, and every index KlyroStream uses, tied to real code and measured with `EXPLAIN ANALYZE`. See also [locking.md](locking.md) for how concurrent writes stay correct, and [uploads.md](uploads.md) for resumable video uploads.
 
 ## What an index is
 

@@ -52,3 +52,29 @@ npx @usebruno/cli run --env local
 ```
 
 This sends every request in the collection and prints each response status. Add `-r` to include subfolders when running a single folder, e.g. `npx @usebruno/cli run health --env local`.
+
+## Video uploads
+
+The `videos/` folder uploads a real video end to end: initiate, presign, every part straight to RustFS, progress, complete. It uses `videos/fixtures/sample-video.mp4`, which is **git-ignored** (GitHub rejects files over 100 MB), so put any mp4 at that path first.
+
+The scripts read the local file, so the collection needs Bruno's **Developer** JavaScript sandbox: in the app, open the collection settings and set **JavaScript Sandbox → Developer Mode**; on the CLI, pass `--sandbox developer`. Run **auth → Login** and **clubs → Create club** first, so `accessToken` and `clubId` are set.
+
+| # | Request | Goes to | Script does | Asserts |
+|---|---|---|---|---|
+| 1 | Initiate upload | API | sets `sizeBytes` from the file on disk; saves `videoId`, `partSize`, `partCount` | 201, `UPLOADING` |
+| 2 | Presign parts | API | asks for parts `1..partCount`; saves `partUrls` | 200 |
+| 3 | Upload part | **RustFS** (presigned URL, no auth header) | reads only that part's byte range from the file; **repeats itself** with `bru.runner.setNextRequest` until every part is sent | 200 and an `ETag`, per part |
+| 4 | Upload progress | API | saves the receipts as `uploadedParts` | nothing missing |
+| 5 | Complete upload | API | | 200, `PROCESSING` |
+| 6 | Abort upload | API | | none: use it *instead of* Complete; after Complete it returns 409, which is expected |
+
+From the command line (API running, `accessToken` from a login):
+
+```bash
+cd bruno
+npx @usebruno/cli run videos --env local --sandbox developer --env-var accessToken=<token> --env-var clubId=<clubId>
+```
+
+With the 228 MB sample: 34 requests (29 of them "Upload part"), 66/66 assertions, about 2.5 s locally.
+
+For parallel parts and resume after a kill, use the CLI: `npm run upload -- <file> --club <clubId>` in `backend/`. See [learning/uploads.md](learning/uploads.md) and [learning/uploads-lab.md](learning/uploads-lab.md).

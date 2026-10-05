@@ -1,6 +1,6 @@
 # Locking and concurrency
 
-How KlyroStream stays correct when two requests touch the same data at the same time. Every section points at real code. See also [indexes.md](indexes.md).
+How KlyroStream stays correct when two requests touch the same data at the same time. Every section points at real code. See also [indexes.md](indexes.md) and [uploads.md](uploads.md).
 
 ## The problem: check-then-act
 
@@ -290,15 +290,38 @@ The store increments the counter and sets its expiry in a single Lua script, whi
 - **Read endpoints** (lists, previews) never lock. Under READ COMMITTED a reader never blocks a writer and a writer never blocks a reader.
 - **Club rename** is last-write-wins. Two admins renaming at once: one name wins, nothing is corrupted.
 
-## Coming up: video status (Sprint 4)
+## 7. Video status: conditional write + a lock across an external call
 
-The video state machine (`UPLOADING → PROCESSING → READY`, `→ ERROR`) will use the conditional-write pattern:
+`videoRepo.transition(id, from, to)` (`repositories/video.repository.ts`) is the only way a video's status changes. It rejects arrows that aren't in the `TRANSITIONS` table (a bug, so it throws), then uses the conditional-write pattern:
 
 ```sql
-UPDATE videos SET status = 'PROCESSING' WHERE id = $1 AND status = 'UPLOADING' RETURNING id;
+UPDATE videos SET status = 'PROCESSING' WHERE id = $1 AND status = 'UPLOADING' RETURNING *;
 ```
 
-0 rows means the video wasn't in the expected state (already completed, aborted, or failed), so a double "complete" click or a complete racing an abort can't both win.
+0 rows means the video wasn't in the expected state, and the service turns that into a 409.
+
+That protects the row, but complete and abort each pair the transition with an **S3 call** (`CompleteMultipartUpload` / `AbortMultipartUpload`), and the conditional write can't protect that pair. Without more, this can happen:
+
+```
+complete: S3 stitches the object ─────────────┐
+abort:                     wins the row → ERROR│
+complete:                       transition → 0 rows
+result:   an object in the bucket for a video marked ERROR
+```
+
+So both run inside `videoRepo.withUploadLock(id, fn)`:
+
+```sql
+BEGIN;
+SELECT * FROM videos WHERE id = $1 AND status = 'UPLOADING' FOR UPDATE;  -- the other request waits here
+-- S3 call
+UPDATE videos SET status = … WHERE id = $1 AND status = 'UPLOADING';
+COMMIT;
+```
+
+The second request waits on the lock, then re-reads the row: it's no longer `UPLOADING`, so it gets 0 rows → 409. Measured: five complete-vs-abort races left 5 `PROCESSING` rows, 5 objects and 0 open sessions.
+
+**Holding a lock during a network call** is normally avoided (it holds a DB connection and blocks anyone else waiting on that row). It's acceptable here because the lock covers one row, only that video's uploader contends for it, and the S3 call is short. If storage hung, the request would hold one pooled connection until it timed out. That's the trade-off.
 
 ## Try it yourself: watch a lock wait
 

@@ -1,0 +1,49 @@
+meta {
+  name: Upload part
+  type: http
+  seq: 3
+}
+
+put {
+  url: {{baseUrl}}
+  body: none
+  auth: none
+}
+
+script:pre-request {
+  const fs = require('fs');
+  const parts = JSON.parse(bru.getVar('partUrls'));
+  const { partNumber, url } = parts[Number(bru.getVar('partIndex'))];
+  const partSize = Number(bru.getVar('partSize'));
+  const file = bru.getVar('videoFile');
+
+  const start = (partNumber - 1) * partSize;
+  const length = Math.min(partSize, fs.statSync(file).size - start);
+  const bytes = Buffer.alloc(length);
+  const fd = fs.openSync(file, 'r');
+  fs.readSync(fd, bytes, 0, length, start);
+  fs.closeSync(fd);
+
+  req.setUrl(url);
+  req.setHeader('content-type', 'application/octet-stream');
+  req.setBody(bytes);
+}
+
+script:post-response {
+  const index = Number(bru.getVar('partIndex')) + 1;
+  bru.setVar('partIndex', index);
+  if (res.status === 200 && index < JSON.parse(bru.getVar('partUrls')).length) {
+    bru.runner.setNextRequest('Upload part');
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.headers.etag: isString
+}
+
+docs {
+  PUTs one part straight to storage with its presigned URL (no auth header: the signature is the auth).
+  The script reads only that part's byte range from the local file, then the request repeats itself until every part is sent.
+  The ETag response header is the receipt for the part (MD5 of its bytes).
+}

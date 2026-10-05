@@ -1,0 +1,51 @@
+meta {
+  name: Initiate upload
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/clubs/{{clubId}}/videos/uploads
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "title": "Bruno sample video",
+    "contentType": "video/mp4",
+    "sizeBytes": 0
+  }
+}
+
+script:pre-request {
+  const fs = require('fs');
+  const path = require('path');
+  const file = path.join(bru.cwd(), 'videos/fixtures/sample-video.mp4');
+  bru.setVar('videoFile', file);
+  req.setBody({ ...req.getBody(), sizeBytes: fs.statSync(file).size });
+}
+
+script:post-response {
+  if (res.status === 201) {
+    const body = res.getBody();
+    bru.setVar('videoId', body.videoId);
+    bru.setVar('partSize', body.partSize);
+    bru.setVar('partCount', body.partCount);
+  }
+}
+
+assert {
+  res.status: eq 201
+  res.body.status: eq UPLOADING
+}
+
+docs {
+  Starts a multipart upload for videos/fixtures/sample-video.mp4, declaring its real size (read from disk).
+  Needs accessToken (auth/Login) and clubId (clubs/Create club). Saves videoId, partSize, partCount.
+  Requires the Developer JavaScript sandbox (the scripts read the local file).
+}
