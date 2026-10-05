@@ -1,14 +1,21 @@
 import { and, asc, count, eq } from 'drizzle-orm';
 import { db, type Tx } from '../lib/db/client.js';
-import { type ClubRole, clubMembers, users } from '../lib/db/schema.js';
+import { type ClubMember, type ClubRole, clubMembers } from '../lib/db/schema.js';
 import { ConflictError, NotFoundError } from '../utils/errors.js';
 
-const memberFields = {
-  userId: clubMembers.userId,
-  email: users.email,
-  role: clubMembers.role,
-  joinedAt: clubMembers.createdAt,
-};
+type MemberRow = Omit<ClubMember, 'clubId'> & { user: { email: string } };
+
+const memberQuery = {
+  columns: { userId: true, role: true, createdAt: true },
+  with: { user: { columns: { email: true } } },
+} as const;
+
+const toMember = ({ userId, role, createdAt, user }: MemberRow) => ({
+  userId,
+  email: user.email,
+  role,
+  joinedAt: createdAt,
+});
 
 const isMember = (clubId: string, userId: string) =>
   and(eq(clubMembers.clubId, clubId), eq(clubMembers.userId, userId));
@@ -35,18 +42,17 @@ const lockMember = async (tx: Tx, clubId: string, userId: string) => {
 
 export const listForClub = async (clubId: string, limit: number, offset: number) => {
   const where = eq(clubMembers.clubId, clubId);
-  const [items, [total]] = await Promise.all([
-    db
-      .select(memberFields)
-      .from(clubMembers)
-      .innerJoin(users, eq(users.id, clubMembers.userId))
-      .where(where)
-      .orderBy(asc(clubMembers.createdAt), asc(clubMembers.userId))
-      .limit(limit)
-      .offset(offset),
+  const [rows, [total]] = await Promise.all([
+    db.query.clubMembers.findMany({
+      ...memberQuery,
+      where,
+      orderBy: [asc(clubMembers.createdAt), asc(clubMembers.userId)],
+      limit,
+      offset,
+    }),
     db.select({ value: count() }).from(clubMembers).where(where),
   ]);
-  return { items, total: total?.value ?? 0 };
+  return { items: rows.map(toMember), total: total?.value ?? 0 };
 };
 
 export const changeRole = (clubId: string, userId: string, role: ClubRole) =>
@@ -55,13 +61,12 @@ export const changeRole = (clubId: string, userId: string, role: ClubRole) =>
     if (member.isLastAdmin && role !== 'admin') throw lastAdminError();
 
     await tx.update(clubMembers).set({ role }).where(isMember(clubId, userId));
-    const [updated] = await tx
-      .select(memberFields)
-      .from(clubMembers)
-      .innerJoin(users, eq(users.id, clubMembers.userId))
-      .where(isMember(clubId, userId));
+    const updated = await tx.query.clubMembers.findFirst({
+      ...memberQuery,
+      where: isMember(clubId, userId),
+    });
     if (!updated) throw new NotFoundError('Member not found', 'MEMBER_NOT_FOUND');
-    return updated;
+    return toMember(updated);
   });
 
 export const remove = (clubId: string, userId: string) =>

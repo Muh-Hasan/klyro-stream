@@ -1,4 +1,4 @@
-import { and, count, desc, eq } from 'drizzle-orm';
+import { and, count, desc, eq, inArray } from 'drizzle-orm';
 import { db } from '../lib/db/client.js';
 import { type ClubRole, clubMembers, clubs, downloadQuotas } from '../lib/db/schema.js';
 
@@ -13,10 +13,8 @@ export const createWithOwner = (name: string, ownerId: string): Promise<Club> =>
     return club;
   });
 
-export const findById = async (clubId: string): Promise<Club | undefined> => {
-  const [club] = await db.select().from(clubs).where(eq(clubs.id, clubId)).limit(1);
-  return club;
-};
+export const findById = (clubId: string): Promise<Club | undefined> =>
+  db.query.clubs.findFirst({ where: eq(clubs.id, clubId) });
 
 export const updateName = async (clubId: string, name: string): Promise<Club | undefined> => {
   const [club] = await db.update(clubs).set({ name }).where(eq(clubs.id, clubId)).returning();
@@ -27,31 +25,31 @@ export const getMemberRole = async (
   clubId: string,
   userId: string,
 ): Promise<ClubRole | undefined> => {
-  const [member] = await db
-    .select({ role: clubMembers.role })
-    .from(clubMembers)
-    .where(and(eq(clubMembers.clubId, clubId), eq(clubMembers.userId, userId)))
-    .limit(1);
+  const member = await db.query.clubMembers.findFirst({
+    columns: { role: true },
+    where: and(eq(clubMembers.clubId, clubId), eq(clubMembers.userId, userId)),
+  });
   return member?.role;
 };
 
 export const listForUser = async (userId: string, limit: number, offset: number) => {
-  const [items, [total]] = await Promise.all([
-    db
-      .select({
-        id: clubs.id,
-        name: clubs.name,
-        ownerId: clubs.ownerId,
-        createdAt: clubs.createdAt,
-        role: clubMembers.role,
-      })
-      .from(clubMembers)
-      .innerJoin(clubs, eq(clubs.id, clubMembers.clubId))
-      .where(eq(clubMembers.userId, userId))
-      .orderBy(desc(clubs.createdAt), desc(clubs.id))
-      .limit(limit)
-      .offset(offset),
-    db.select({ value: count() }).from(clubMembers).where(eq(clubMembers.userId, userId)),
+  const isMember = eq(clubMembers.userId, userId);
+  const [rows, [total]] = await Promise.all([
+    db.query.clubs.findMany({
+      columns: { id: true, name: true, ownerId: true, createdAt: true },
+      where: inArray(
+        clubs.id,
+        db.select({ clubId: clubMembers.clubId }).from(clubMembers).where(isMember),
+      ),
+      with: { members: { columns: { role: true }, where: isMember } },
+      orderBy: [desc(clubs.createdAt), desc(clubs.id)],
+      limit,
+      offset,
+    }),
+    db.select({ value: count() }).from(clubMembers).where(isMember),
   ]);
+  const items = rows.flatMap(({ members, ...club }) =>
+    members[0] ? [{ ...club, role: members[0].role }] : [],
+  );
   return { items, total: total?.value ?? 0 };
 };

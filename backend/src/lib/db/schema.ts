@@ -192,6 +192,7 @@ export const usersRelations = relations(users, ({ many }) => ({
 export const clubsRelations = relations(clubs, ({ one, many }) => ({
   owner: one(users, { fields: [clubs.ownerId], references: [users.id] }),
   members: many(clubMembers),
+  invitations: many(clubInvitations),
   videos: many(videos),
   quota: one(downloadQuotas, { fields: [clubs.id], references: [downloadQuotas.clubId] }),
 }));
@@ -199,6 +200,11 @@ export const clubsRelations = relations(clubs, ({ one, many }) => ({
 export const clubMembersRelations = relations(clubMembers, ({ one }) => ({
   user: one(users, { fields: [clubMembers.userId], references: [users.id] }),
   club: one(clubs, { fields: [clubMembers.clubId], references: [clubs.id] }),
+}));
+
+export const clubInvitationsRelations = relations(clubInvitations, ({ one }) => ({
+  club: one(clubs, { fields: [clubInvitations.clubId], references: [clubs.id] }),
+  inviter: one(users, { fields: [clubInvitations.invitedBy], references: [users.id] }),
 }));
 
 export const videosRelations = relations(videos, ({ one, many }) => ({

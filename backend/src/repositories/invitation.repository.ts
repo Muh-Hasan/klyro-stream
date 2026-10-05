@@ -1,6 +1,6 @@
 import { and, count, desc, eq, gt } from 'drizzle-orm';
 import { db, type Tx } from '../lib/db/client.js';
-import { clubInvitations, clubMembers, clubs, users } from '../lib/db/schema.js';
+import { clubInvitations, clubMembers, users } from '../lib/db/schema.js';
 
 export type Invitation = typeof clubInvitations.$inferSelect;
 export type NewInvitation = typeof clubInvitations.$inferInsert;
@@ -8,17 +8,10 @@ export type NewInvitation = typeof clubInvitations.$inferInsert;
 const isPending = (clubId: string) =>
   and(eq(clubInvitations.clubId, clubId), eq(clubInvitations.status, 'pending'));
 
-export const findPending = async (
-  clubId: string,
-  email: string,
-): Promise<Invitation | undefined> => {
-  const [invitation] = await db
-    .select()
-    .from(clubInvitations)
-    .where(and(isPending(clubId), eq(clubInvitations.email, email)))
-    .limit(1);
-  return invitation;
-};
+export const findPending = (clubId: string, email: string): Promise<Invitation | undefined> =>
+  db.query.clubInvitations.findFirst({
+    where: and(isPending(clubId), eq(clubInvitations.email, email)),
+  });
 
 export const create = async (data: NewInvitation): Promise<Invitation> => {
   const [invitation] = await db.insert(clubInvitations).values(data).returning();
@@ -35,44 +28,33 @@ export const markExpired = async (id: string): Promise<void> => {
 
 export const listPending = async (clubId: string, limit: number, offset: number) => {
   const where = and(isPending(clubId), gt(clubInvitations.expiresAt, new Date()));
-  const [items, [total]] = await Promise.all([
-    db
-      .select({
-        id: clubInvitations.id,
-        email: clubInvitations.email,
-        role: clubInvitations.role,
-        invitedBy: { id: users.id, email: users.email },
-        expiresAt: clubInvitations.expiresAt,
-        createdAt: clubInvitations.createdAt,
-      })
-      .from(clubInvitations)
-      .innerJoin(users, eq(users.id, clubInvitations.invitedBy))
-      .where(where)
-      .orderBy(desc(clubInvitations.createdAt), desc(clubInvitations.id))
-      .limit(limit)
-      .offset(offset),
+  const [rows, [total]] = await Promise.all([
+    db.query.clubInvitations.findMany({
+      columns: { id: true, email: true, role: true, expiresAt: true, createdAt: true },
+      with: { inviter: { columns: { id: true, email: true } } },
+      where,
+      orderBy: [desc(clubInvitations.createdAt), desc(clubInvitations.id)],
+      limit,
+      offset,
+    }),
     db.select({ value: count() }).from(clubInvitations).where(where),
   ]);
+  const items = rows.map(({ inviter, ...invitation }) => ({ ...invitation, invitedBy: inviter }));
   return { items, total: total?.value ?? 0 };
 };
 
 export const findByTokenHash = async (tokenHash: string) => {
-  const [invitation] = await db
-    .select({
-      id: clubInvitations.id,
-      email: clubInvitations.email,
-      role: clubInvitations.role,
-      status: clubInvitations.status,
-      expiresAt: clubInvitations.expiresAt,
-      club: { id: clubs.id, name: clubs.name },
-      invitedBy: { email: users.email },
-    })
-    .from(clubInvitations)
-    .innerJoin(clubs, eq(clubs.id, clubInvitations.clubId))
-    .innerJoin(users, eq(users.id, clubInvitations.invitedBy))
-    .where(eq(clubInvitations.tokenHash, tokenHash))
-    .limit(1);
-  return invitation;
+  const invitation = await db.query.clubInvitations.findFirst({
+    columns: { id: true, email: true, role: true, status: true, expiresAt: true },
+    with: {
+      club: { columns: { id: true, name: true } },
+      inviter: { columns: { email: true } },
+    },
+    where: eq(clubInvitations.tokenHash, tokenHash),
+  });
+  if (!invitation) return undefined;
+  const { inviter, ...rest } = invitation;
+  return { ...rest, invitedBy: inviter };
 };
 
 const claim = async (tx: Tx, id: string, status: 'accepted' | 'rejected') => {

@@ -5,27 +5,19 @@ import { users } from '../lib/db/schema.js';
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 
-export const findByEmail = async (email: string): Promise<User | undefined> => {
-  const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
-  return user;
-};
+export const findByEmail = (email: string): Promise<User | undefined> =>
+  db.query.users.findFirst({ where: eq(users.email, email) });
 
-export const findById = async (id: string): Promise<User | undefined> => {
-  const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
-  return user;
-};
+export const findById = (id: string): Promise<User | undefined> =>
+  db.query.users.findFirst({ where: eq(users.id, id) });
 
-export const findByProvider = async (
+export const findByProvider = (
   provider: User['provider'],
   providerId: string,
-): Promise<User | undefined> => {
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(and(eq(users.provider, provider), eq(users.providerId, providerId)))
-    .limit(1);
-  return user;
-};
+): Promise<User | undefined> =>
+  db.query.users.findFirst({
+    where: and(eq(users.provider, provider), eq(users.providerId, providerId)),
+  });
 
 export const bumpTokenVersion = async (id: string): Promise<void> => {
   await db
