@@ -1,12 +1,8 @@
-# Learning notes
+# Database indexes (PostgreSQL)
 
-Things worth understanding properly while building KlyroStream. Each section is tied to real code in this repo.
+How indexes work, and every index KlyroStream uses, tied to real code and measured with `EXPLAIN ANALYZE`. See also [locking.md](locking.md) for how concurrent writes stay correct.
 
----
-
-## Database indexes (PostgreSQL)
-
-### What an index is
+## What an index is
 
 A table is stored as an unordered pile of rows (the *heap*). To answer `WHERE email = 'a@b.com'` without help, Postgres reads **every row** and throws away the ones that don't match. That is a **sequential scan**: its cost grows with the table.
 
@@ -22,7 +18,7 @@ An index is a separate, **sorted** structure that maps column values to row loca
 
 Besides `=`, a B-tree also handles `<`, `>`, `BETWEEN`, `ORDER BY`, `IN`, and `LIKE 'prefix%'`. Postgres has other index types (GIN for arrays/JSON/full-text, GiST for geometry/ranges, BRIN for huge append-only tables, hash), but every index in this project is a B-tree.
 
-### What it costs
+## What it costs
 
 Indexes are not free:
 
@@ -32,7 +28,7 @@ Indexes are not free:
 
 The rule: **index the columns your queries actually filter, join, or sort on, and nothing else.**
 
-### Kinds of index used here
+## Kinds of index used here
 
 | Kind | What it means | Example in our schema |
 |---|---|---|
@@ -44,7 +40,7 @@ The rule: **index the columns your queries actually filter, join, or sort on, an
 
 A **full** index (the normal case) covers every row in the table. A **partial** index covers only some rows. More on that below.
 
-### Composite indexes: column order matters
+## Composite indexes: column order matters
 
 A composite index is sorted by its first column, then by the second within each first value, like a phone book (last name, then first name).
 
@@ -63,7 +59,7 @@ That is exactly why `club_members` has **two** indexes:
 
 It also means an index on `(a)` is **redundant** when `(a, b)` already exists, because `(a, b)` serves `WHERE a = ?` too. See `videos_club_idx` below.
 
-### Partial indexes
+## Partial indexes
 
 ```ts
 uniqueIndex('club_invitations_pending_uniq')
@@ -80,7 +76,7 @@ The catch: the planner can only use a partial index when the query's `WHERE` **i
 
 Other good candidates for partial indexes are a small "hot" subset of a big table: active jobs, unread notifications, non-deleted rows.
 
-### Every index in the schema
+## Every index in the schema
 
 All of them live in `backend/src/lib/db/schema.ts`.
 
@@ -103,7 +99,7 @@ All of them live in `backend/src/lib/db/schema.ts`.
 | `download_logs_video_idx` | `video_id` | plain | Downloads per video (Sprint 7) |
 | `download_logs_user_idx` | `user_id` | plain | Downloads per user (Sprint 7) |
 
-### Measured, not guessed: `EXPLAIN ANALYZE`
+## Measured, not guessed: `EXPLAIN ANALYZE`
 
 `EXPLAIN` shows the plan Postgres *would* use. `EXPLAIN ANALYZE` runs the query and shows real timings. These plans were taken from the dev database after inserting 100k users and 100k invitations **inside a transaction that was rolled back**, so nothing was kept:
 
@@ -168,7 +164,7 @@ Seq Scan on users  Filter: (email ~~ '%5000@example.com')   Execution Time: 33.5
 ```
 A B-tree is sorted from the start of the value, so `'abc%'` can use it but `'%abc'` cannot. Searching by substring needs a trigram (`pg_trgm`) GIN index, or full-text search.
 
-#### Reading a plan
+### Reading a plan
 
 | You see | Meaning |
 |---|---|
@@ -179,7 +175,7 @@ A B-tree is sorted from the start of the value, so `'abc%'` can use it but `'%ab
 | `Rows Removed by Filter: N` | Rows read and then thrown away. Large N means a missing or unusable index. |
 | `cost=a..b` | The planner's estimate (abstract units); `actual time` is the truth |
 
-### Does it actually help? Optimisation notes
+## Does it actually help? Optimisation notes
 
 **What already helps the most**
 - `getMemberRole` runs on every club route (through `requireClubRole`). It is a primary-key lookup on `(user_id, club_id)`, so the permission check stays constant-time as the platform grows.
@@ -206,7 +202,7 @@ Postgres indexes the *referenced* side (the primary key) but **not** the referen
 **Covering indexes (not used yet)**
 `CREATE INDEX ... ON t (a) INCLUDE (b)` stores extra column `b` in the index so a query reading only `a` and `b` gets an **Index Only Scan**. Worth it only for very hot queries.
 
-### Checking indexes on a running database
+## Checking indexes on a running database
 
 ```sql
 -- every index with its size
@@ -224,7 +220,7 @@ explain analyze select ...;
 Run them inside the container:
 `docker exec -it klyro-postgres-1 psql -U <user> -d klyro`
 
-### Adding an index in this project
+## Adding an index in this project
 
 1. Declare it in the table's callback in `backend/src/lib/db/schema.ts` (`index(...)`, `uniqueIndex(...)`, optional `.where(sql\`...\`)` for a partial one).
 2. `npm run db:generate` to write the migration, then review the SQL.
@@ -233,7 +229,7 @@ Run them inside the container:
 
 On a large production table, a plain `CREATE INDEX` blocks writes while it builds. `CREATE INDEX CONCURRENTLY` avoids that, but cannot run inside a transaction, so it needs a hand-written migration.
 
-### Cheat sheet
+## Cheat sheet
 
 - An index helps **reads that filter, join, or sort** on its columns, and slows **every write**.
 - A unique index is a **rule** and a **lookup**.
