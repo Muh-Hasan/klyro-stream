@@ -212,3 +212,9 @@ export const abortVideoUpload = async (videoId: string, userId: string): Promise
   });
   if (!video) throw notInProgress();
 };
+
+export const markVideoReady = (videoId: string) =>
+  videoRepo.transition(videoId, 'PROCESSING', 'READY');
+
+export const markVideoFailed = (videoId: string, errorMessage: string) =>
+  videoRepo.transition(videoId, 'PROCESSING', 'ERROR', { errorMessage });

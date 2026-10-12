@@ -40,9 +40,17 @@ const schema = z.object({
   S3_REGION: z.string().default('us-east-1'),
   S3_ACCESS_KEY: z.string().min(1),
   S3_SECRET_KEY: z.string().min(1),
+
+  WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(1),
+  FAIL_RATE: z.coerce.number().min(0).max(1).default(0),
 });
 
-const parsed = schema.safeParse(process.env);
+const parsed = schema
+  .refine((value) => value.NODE_ENV !== 'production' || value.FAIL_RATE === 0, {
+    message: 'FAIL_RATE must be 0 in production.',
+    path: ['FAIL_RATE'],
+  })
+  .safeParse(process.env);
 
 if (!parsed.success) {
   // The logger isn't available yet (it depends on env), so this is the one allowed console call.
