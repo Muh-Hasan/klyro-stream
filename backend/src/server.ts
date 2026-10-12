@@ -11,6 +11,8 @@ import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { closeDb } from './lib/db/client.js';
 import { closeMailer } from './lib/mail/mailer.js';
+import { closeQueueConnections } from './lib/queue/connection.js';
+import { closeQueues } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
 import { logger } from './utils/logger.js';
 
@@ -39,7 +41,11 @@ const shutdown = async (reason: string, exitCode = 0) => {
   });
 
   closeMailer();
-  const results = await Promise.allSettled([closeDb(), closeRedis()]);
+  const results = await Promise.allSettled([
+    closeQueues().finally(closeQueueConnections),
+    closeDb(),
+    closeRedis(),
+  ]);
   for (const result of results) {
     if (result.status === 'rejected') logger.error({ err: result.reason }, 'error during shutdown');
   }

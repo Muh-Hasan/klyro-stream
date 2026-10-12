@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ClubRole } from '../lib/db/schema.js';
+import { enqueueTranscode } from '../lib/queue/queues.js';
 import {
   abortUpload,
   completeUpload,
@@ -120,6 +121,7 @@ export const completeVideoUpload = async (
   videoId: string,
   userId: string,
   input: CompleteUploadInput,
+  requestId?: string,
 ) => {
   const { partCount } = planParts((await loadOwnUpload(videoId, userId)).sizeBytes);
 
@@ -184,6 +186,10 @@ export const completeVideoUpload = async (
       outcome.sizeMismatch,
     );
   }
+
+  await enqueueTranscode(videoId, requestId).catch((err: unknown) =>
+    logger.error({ err, videoId }, 'failed to enqueue transcode'),
+  );
   return { videoId: outcome.video.id, status: outcome.video.status };
 };
 

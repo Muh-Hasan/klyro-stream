@@ -35,7 +35,13 @@ export const uploadProgress: RequestHandler = async (req, res) => {
 
 export const completeUpload: RequestHandler = async (req, res) => {
   const { params, body } = getInput<typeof completeUploadSchemas>(res);
-  const result = await videoService.completeVideoUpload(params.videoId, currentUser(req).id, body);
+  const requestId = typeof req.id === 'string' ? req.id : undefined;
+  const result = await videoService.completeVideoUpload(
+    params.videoId,
+    currentUser(req).id,
+    body,
+    requestId,
+  );
   res.json(result);
 };
 
