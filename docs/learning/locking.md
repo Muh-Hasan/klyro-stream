@@ -1,6 +1,6 @@
 # Locking and concurrency
 
-How KlyroStream stays correct when two requests touch the same data at the same time. Every section points at real code. See also [indexes.md](indexes.md) and [uploads.md](uploads.md).
+How KlyroStream stays correct when two requests touch the same data at the same time. Every section points at real code. See also [transactions.md](transactions.md) (the overview map), [indexes.md](indexes.md) and [uploads.md](uploads.md).
 
 ## The problem: check-then-act
 

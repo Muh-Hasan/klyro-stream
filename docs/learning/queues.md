@@ -1,12 +1,12 @@
 # Job queues, workers and BullMQ
 
-How KlyroStream moves slow work (transcoding, emails, captions) out of HTTP requests and into a separate worker process. It starts from zero: what a queue is, what BullMQ is, what a "worker" actually is, how jobs get processed, concurrency vs parallelism, and the limits. It then compares BullMQ with RabbitMQ and Kafka, and ends with how to structure multi-stage work (single job, step job, flow). Every section points at real code, a measurement, or the sprint that will use it. See also [uploads.md](uploads.md) for how a video reaches PROCESSING, and [locking.md](locking.md) for the state-machine transition the worker relies on.
+How KlyroStream moves slow work (transcoding, emails, captions) out of HTTP requests and into a separate worker process. It starts from zero: what a queue is, what BullMQ is, what a "worker" actually is, how jobs get processed, concurrency vs parallelism, and the limits. It then compares BullMQ with RabbitMQ and Kafka, and ends with how to structure multi-stage work (single job, step job, flow). Every section points at real code, a measurement, or the sprint that will use it. See also [uploads.md](uploads.md) for how a video reaches PROCESSING, [locking.md](locking.md) for the state-machine transition the worker relies on, and [transactions.md](transactions.md) for every transaction and lock on the Postgres side.
 
 **Contents**
 
 1. [Fundamentals](#part-1-fundamentals): the problem, queues, BullMQ, workers, how a job is processed, concurrency, limits, durability
 2. [BullMQ vs RabbitMQ vs Kafka](#part-2-bullmq-vs-rabbitmq-vs-kafka)
-3. [What KlyroStream built in Sprint 5](#part-3-what-klyrostream-built-in-sprint-5): the whole flow on one page, the three locks, connections, `enqueueTranscode` (Promise.race + AbortController), the transactional outbox, the worker and its stub, `WORKER_CONCURRENCY`, shutdown, Bull Board, recovery scripts, measurements
+3. [What KlyroStream built in Sprint 5](#part-3-what-klyrostream-built-in-sprint-5): the whole flow on one page, the three locks, connections, `enqueueTranscode` (Promise.race + AbortController), the transactional outbox, the worker and its stub, `WORKER_CONCURRENCY` and how jobs are shared between workers, shutdown, Bull Board, recovery scripts, measurements
 4. [Structuring multi-stage work](#part-4-structuring-multi-stage-work): single job, step job, flow, and why transcode + thumbnail is not a flow
 5. [The plan per sprint](#part-5-the-plan-for-klyrostream), gotchas, further reading
 
@@ -732,6 +732,49 @@ The `worker ready` log line prints the value in use. Measured with the 2.5 s stu
 | A cap across *all* workers (e.g. an external API limit) | `queue.setGlobalConcurrency(n)` or a `limiter`, not this |
 
 The API process ignores this variable; only `worker.ts` reads it.
+
+#### How many jobs at once, and who gets which job?
+
+**Capacity is the total number of slots:** `jobs in flight = Σ (worker processes × their concurrency)`. With one worker at `concurrency: 1`, exactly one video is processed at a time. The other 49 of a 50-video batch sit in `wait`, safe in Redis, until a slot frees up. Nothing is lost or rejected; the queue *is* the buffer.
+
+**It is not round-robin, and nobody hands out jobs.** There's no dispatcher that pushes job 1 to worker A and job 2 to worker B. Each worker **pulls**: whenever one of its slots is free, it asks Redis for the next job. These are called *competing consumers*.
+
+```
+                        Redis: bull:video-processing
+              wait (list, oldest on the right)              active
+   add() ─► LPUSH ─► [ j7 | j6 | j5 | j4 ] ── RPOPLPUSH ──► [ j1 j2 j3 ]
+                                              (atomic Lua: one job → one caller)
+                        ▲            ▲             ▲
+          free slot? ───┘            │             └─── free slot?
+   worker A (conc 1)         worker B (conc 2)          worker C (conc 1)
+   busy: j1                  busy: j2, j3               idle → gets j4 next
+```
+
+How a fetch works (BullMQ 6, from `worker.js` and `moveToActive-11.lua`):
+1. The worker's main loop keeps asking while `jobs in progress < concurrency`.
+2. If `wait` is empty, it blocks on Redis with `BZPOPMIN` on the queue's marker key (up to 10 s at a time), so idle workers don't poll in a busy loop. `add()` touches the marker and wakes one blocked worker.
+3. The `moveToActive` Lua script does `RPOPLPUSH wait → active` and sets the job lock. Redis runs scripts one at a time, so **two workers can never pop the same job**.
+
+What that gives you:
+- **Load balancing for free.** A worker that is busy doesn't ask, so jobs go to whoever has spare capacity. A slow machine simply takes fewer jobs, which beats round-robin: round-robin would hand a busy worker its turn anyway.
+- **Order is FIFO** (oldest job first) by default. `priority` and `lifo` job options change that; we use neither.
+- **Order of *completion* isn't guaranteed** once there's more than one slot. A 2 GB video started first finishes after a 50 MB one started second.
+
+**Do we need more worker instances?** Only when jobs wait longer than you want. Run the numbers:
+
+```
+ throughput ≈ slots × 60 / minutes-per-job       (jobs per hour)
+ 1 slot, 3 min per video  → 20 videos / hour
+ a batch of 50            → the last one waits ~2.5 h
+ 3 workers (3 slots)      → 60 / hour, last one ~50 min
+```
+
+Scaling out needs **no code or config change**. Start another `npm run dev:worker` (or `docker compose up --scale worker=3` in Sprint 6) pointing at the same Redis and Postgres, and it starts pulling. Each new process brings its own Redis connections and its own `DB_POOL_MAX` Postgres pool, so watch the total connection count when scaling far.
+
+What scaling out doesn't fix:
+- **CPU on one machine.** Three workers on a 4-core laptop compete for the same cores. Each FFmpeg gets slower, and total throughput barely moves. Scale across machines, or measure first (Sprint 11).
+- **Storage bandwidth.** Every worker downloads the raw file and uploads the HLS output. Eventually the object store is the bottleneck.
+- **Correctness.** That doesn't need fixing: idempotent jobIds, job locks and the conditional `UPDATE … WHERE status='PROCESSING'` already make several workers safe. That's exactly why they were built in Sprint 5.
 
 ### Graceful shutdown
 
