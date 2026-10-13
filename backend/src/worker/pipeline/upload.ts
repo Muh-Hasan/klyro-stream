@@ -33,21 +33,21 @@ export const uploadDir = async (
 
   let next = 0;
   let bytes = 0;
-  let failed = false;
+  let failure: Error | undefined;
   const worker = async () => {
-    while (!failed && next < files.length) {
+    while (failure === undefined && next < files.length) {
       const file = files[next++]!;
       const key = `${prefix}${path.relative(dir, file).split(path.sep).join('/')}`;
       try {
         const size = await uploadFile(file, bucket, key, signal);
         bytes += size;
       } catch (err) {
-        failed = true;
-        throw err;
+        failure ??= err instanceof Error ? err : new Error(String(err));
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, files.length) }, worker));
+  if (failure !== undefined) throw failure;
 
   return { files: files.length, bytes };
 };
