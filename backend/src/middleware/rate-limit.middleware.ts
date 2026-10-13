@@ -29,10 +29,11 @@ class RecoveringRedisStore extends RedisStore {
   }
 }
 
-const limiter = (name: string, limit: number, windowMs: number) =>
+const limiter = (name: string, limit: number, windowMs: number, countFailuresOnly = false) =>
   rateLimit({
     windowMs,
     limit,
+    skipSuccessfulRequests: countFailuresOnly,
     standardHeaders: 'draft-8',
     legacyHeaders: false,
     passOnStoreError: true,
@@ -48,3 +49,4 @@ export const loginLimiter = limiter('login', 5, 15 * MINUTE);
 export const registerLimiter = limiter('register', 5, 60 * MINUTE);
 export const forgotPasswordLimiter = limiter('forgot-password', 3, 60 * MINUTE);
 export const resetPasswordLimiter = limiter('reset-password', 5, 15 * MINUTE);
+export const adminLimiter = limiter('admin', 10, 15 * MINUTE, true);

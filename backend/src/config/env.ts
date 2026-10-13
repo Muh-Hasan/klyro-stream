@@ -10,6 +10,9 @@ const csv = z.string().transform((value) =>
     .filter(Boolean),
 );
 
+const optional = <T extends z.ZodType>(type: T) =>
+  z.preprocess((value) => (value === '' ? undefined : value), type.optional());
+
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
@@ -41,6 +44,9 @@ const schema = z.object({
   S3_ACCESS_KEY: z.string().min(1),
   S3_SECRET_KEY: z.string().min(1),
 
+  BULL_BOARD_USER: optional(z.string()),
+  BULL_BOARD_PASSWORD: optional(z.string().min(12)),
+
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(1),
   FAIL_RATE: z.coerce.number().min(0).max(1).default(0),
 });
@@ -49,6 +55,10 @@ const parsed = schema
   .refine((value) => value.NODE_ENV !== 'production' || value.FAIL_RATE === 0, {
     message: 'FAIL_RATE must be 0 in production.',
     path: ['FAIL_RATE'],
+  })
+  .refine((value) => Boolean(value.BULL_BOARD_USER) === Boolean(value.BULL_BOARD_PASSWORD), {
+    message: 'Set both BULL_BOARD_USER and BULL_BOARD_PASSWORD, or neither.',
+    path: ['BULL_BOARD_PASSWORD'],
   })
   .safeParse(process.env);
 

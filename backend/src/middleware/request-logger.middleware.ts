@@ -22,7 +22,11 @@ export const requestLogger = pinoHttp({
     res.setHeader('X-Request-Id', id);
     return id;
   },
-  autoLogging: { ignore: (req) => QUIET_PATHS.has(pathOf(req.url)) },
+  autoLogging: {
+    ignore: (req) =>
+      QUIET_PATHS.has(pathOf(req.url)) ||
+      (req.method === 'GET' && pathOf(req.url).startsWith('/admin/queues')),
+  },
   customLogLevel: (_req, res, err) => {
     if (err || res.statusCode >= 500) return 'error';
     if (res.statusCode >= 400) return 'warn';
