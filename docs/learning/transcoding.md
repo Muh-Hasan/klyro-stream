@@ -293,7 +293,44 @@ The fix, and what the worker does: start FFmpeg with its working directory set t
 
 ### Progress
 
-`-progress pipe:1` makes FFmpeg print `key=value` lines to stdout every ~0.5 s, including `out_time_us` (how far into the video it is). Progress % = `out_time_us / (duration × 1,000,000)`. Stage 3 parses this for Bull Board.
+`-progress pipe:1` makes FFmpeg print `key=value` lines to stdout every ~0.5 s, including `out_time_us` (how far into the video it is). Progress % = `out_time_us / (duration × 1,000,000)`.
+
+### In the code: `src/worker/pipeline/transcode.ts`
+
+| Function | Pure? | Job |
+|---|---|---|
+| `planRenditions({ width, height })` | yes | Filters the ladder by the **short side**, scales both sides by the same factor, rounds to even numbers. A source smaller than 480 keeps its own size |
+| `buildHlsArgs(source, renditions, hasAudio)` | yes | Builds the argument array from section 7. Without audio it drops the `0:a:0` maps, the AAC options and the `a:i` parts of `var_stream_map` |
+| `runFfmpeg(args, { cwd, durationSeconds, onProgress, signal })` | no | `spawn('ffmpeg', args)` with **no shell**. Reads `-progress pipe:1` line by line, calls `onProgress` only when the whole percent goes up (so Redis isn't flooded), keeps the last 2 KB of stderr for the error message |
+| `transcodeHls(source, outDir, meta, onProgress, signal)` | no | Plans, creates `outDir`, runs FFmpeg inside it, returns the renditions |
+
+`buildHlsArgs` returns an array, and `spawn` passes each element to FFmpeg as one argument. No shell ever parses the command, so a file name with spaces, quotes or `; rm -rf` in it can't break out. The same reason we never build a command string.
+
+**Errors:** a non-zero exit becomes `UnrecoverableError` when stderr says the input is bad (`Invalid data found`, `moov atom not found`), otherwise a plain `Error`, which is retried. When the `signal` is aborted, Node kills FFmpeg and the promise rejects with `AbortError`; Stage 6 uses that on SIGTERM.
+
+**Planned ladders:**
+
+| Source | Renditions |
+|---|---|
+| 3840×2160 | 1920×1080, 1280×720, 854×480 |
+| 1280×720 | 1280×720, 854×480 |
+| 1080×1920 (portrait) | 1080×1920, 720×1280, 480×854 |
+| 640×360 | 640×360 only |
+| 1440×1080 (4:3) | 1440×1080, 960×720, 640×480 |
+| 3840×1608 (cinema 2.39:1) | 2580×1080, 1720×720, 1146×480 |
+
+**Measured:**
+
+| Input | Result |
+|---|---|
+| 4K sample, Windows, FFmpeg 9 | 30.7 s for 31.88 s of video; 52 progress updates rising to 100; every segment of every rendition starts with `I`; durations `6 6 6 6 6 1.88` everywhere |
+| 4K sample, worker container, FFmpeg 5.1 | 37.6 s; same renditions and segment durations |
+| Portrait phone clip | 720×1280 and 480×854, no upscale to 1080 |
+| Clip without audio | One 360p rendition, `CODECS="avc1.64001e"` with no audio codec |
+| Random bytes | `UnrecoverableError … moov atom not found … Invalid data` |
+| Aborted after 3 s | `AbortError` after 3004 ms, no FFmpeg process left running |
+
+**FFmpeg 5.1 vs 9.0.** The container's 5.1 writes `BANDWIDTH` from the *configured* rates (5,640,800 = (5000k + 128k) × 1.1) and no `AVERAGE-BANDWIDTH`; 9.0 measures the real peak and average. Both are valid HLS. ffprobe also reported the duration slightly differently (31.91 s vs 31.88 s). The container is what runs in production, so its output is the one that counts.
 
 ## 8. Probing the input first
 
@@ -372,6 +409,45 @@ A Flow is the right tool when the pieces are **independent, expensive, and there
 
 The Sprint 6 pipeline functions (`downloadSource`, `probe`, `transcode`, `makeThumbnail`, `uploadDir`) take paths and return results; none of them knows about jobs. Turning the single job into a Flow later only changes the orchestrator, not the pieces.
 
+### What about a step job, or a step job with a Flow?
+
+A **step job** ([queues.md](queues.md#2-step-job)) is still one job, but it saves "I finished stage X" in its own data with `job.updateData`, so a retry skips the stages that are already done. A **step job with a Flow** goes further: the job probes, adds child jobs pointing at itself, throws `WaitingChildrenError`, and resumes as the parent once they finish.
+
+A checkpoint is only worth saving if (a) the stage before it is expensive and (b) its output survives the retry. Measured costs per stage for the 4K sample:
+
+| Stage | Cost | Output durable? |
+|---|---|---|
+| Download | 1–2.5 s | No: `/tmp` is deleted in `finally`, and a retry may run on another worker |
+| Probe | milliseconds | No (but it's free to redo) |
+| **Transcode** | **31–46 s** | No, still in `/tmp` |
+| Thumbnail | < 1 s | No |
+| Upload | a few seconds | **Yes**, in RustFS |
+| Mark READY | milliseconds | Yes, in Postgres |
+
+The only stage worth not repeating is the transcode, and its output only becomes durable **after the upload**. So a step job has exactly one useful checkpoint:
+
+```mermaid
+flowchart LR
+    subgraph S1["step: produce (retry repeats all of it)"]
+        direction LR
+        D["download"] --> P["probe"] --> T["transcode"] --> TH["thumbnail"] --> U["upload"]
+    end
+    U --> CP{{"updateData<br/>step = uploaded<br/>+ paths, duration"}}
+    CP --> R["step: finalize<br/>mark READY"]
+```
+
+It saves us from exactly one failure: everything uploaded, then the READY update fails (Postgres restarting, a connection blip). Without the checkpoint, the retry re-transcodes; with it, the retry goes straight to READY. That's cheap to add (one `updateData`, one `if` at the start), so **Stage 6 adds it**.
+
+Checkpoints *inside* the produce step don't help: a transcode that's half done can't be resumed, and an upload that fails halfway is simply redone, because objects with the same key are overwritten.
+
+**Step job with a Flow** (dynamic children) only pays off when the children are worth spreading over several machines: the Phase 2 "one child per chunk" design. With one machine and one FFmpeg run, the parent would add a single child and wait for it, which is a step job with extra Redis keys.
+
+| Option | Sprint 6? | Why |
+|---|---|---|
+| Single job | ✅ base | One decode, simplest to follow in Bull Board |
+| + one step checkpoint after upload | ✅ Stage 6 | Cheap; avoids a re-transcode when only the READY update failed |
+| Step job + Flow children | ❌ Phase 2 | Needs several machines and chunked encoding to beat one FFmpeg run |
+
 ## 10. The Sprint 6 pipeline
 
 ```mermaid
@@ -390,8 +466,8 @@ flowchart LR
 |---|---|---|
 | 1. Container with FFmpeg | Done | `backend/Dockerfile` (`worker` target), `docker-compose.yml` (`worker` service, `profiles: [worker]`) |
 | 2. Download + probe | Done | `lib/storage/objects.ts`, `worker/pipeline/download.ts`, `worker/pipeline/probe.ts` |
-| 3. Transcode | Next | `buildHlsArgs` (pure), `runFfmpeg` (`spawn`, progress) |
-| 4. Thumbnail | | |
+| 3. Transcode | Done | `worker/pipeline/transcode.ts`: `planRenditions`, `buildHlsArgs` (pure), `runFfmpeg` (`spawn`, progress, stop on abort), `transcodeHls` |
+| 4. Thumbnail | Next | |
 | 5. Upload outputs | | Content types: `.m3u8` → `application/vnd.apple.mpegurl`, `.ts` → `video/mp2t` |
 | 6. Wire the processor | | Temp dir, weighted progress, READY/ERROR, SIGTERM stops FFmpeg |
 | 7. Prove it | | hls.js with a throttled network, "minutes per GB" |
