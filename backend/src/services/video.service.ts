@@ -193,10 +193,8 @@ export const completeVideoUpload = async (
   return { videoId: outcome.video.id, status: outcome.video.status };
 };
 
-export const abortVideoUpload = async (videoId: string, userId: string): Promise<void> => {
-  await loadOwnUpload(videoId, userId);
-
-  const video = await videoRepo.withUploadLock(videoId, async (locked, tx) => {
+const abortLockedUpload = (videoId: string, errorMessage: string) =>
+  videoRepo.withUploadLock(videoId, async (locked, tx) => {
     if (locked.rawPath && locked.uploadId) {
       await abortUpload(locked.rawPath, locked.uploadId).catch((err: unknown) => {
         if (storageErrorName(err) !== 'NoSuchUpload') throw err;
@@ -206,12 +204,19 @@ export const abortVideoUpload = async (videoId: string, userId: string): Promise
       videoId,
       'UPLOADING',
       'ERROR',
-      { uploadId: null, errorMessage: 'Upload aborted by the uploader' },
+      { uploadId: null, errorMessage },
       tx,
     );
   });
+
+export const abortVideoUpload = async (videoId: string, userId: string): Promise<void> => {
+  await loadOwnUpload(videoId, userId);
+  const video = await abortLockedUpload(videoId, 'Upload aborted by the uploader');
   if (!video) throw notInProgress();
 };
+
+export const expireUpload = (videoId: string, errorMessage: string) =>
+  abortLockedUpload(videoId, errorMessage);
 
 export const markVideoReady = (videoId: string) =>
   videoRepo.transition(videoId, 'PROCESSING', 'READY');

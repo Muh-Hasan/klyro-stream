@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, asc, eq, lt } from 'drizzle-orm';
 import { db, type Tx } from '../lib/db/client.js';
 import { type Video, type NewVideo, type VideoStatus, videos } from '../lib/db/schema.js';
 
@@ -35,6 +35,36 @@ export const create = async (data: NewVideo): Promise<Video> => {
 
 export const findById = (id: string): Promise<Video | undefined> =>
   db.query.videos.findFirst({ where: eq(videos.id, id) });
+
+export const findProcessingSince = (
+  before: Date,
+  limit: number,
+  clubId?: string,
+): Promise<Video[]> =>
+  db.query.videos.findMany({
+    where: and(
+      eq(videos.status, 'PROCESSING'),
+      lt(videos.updatedAt, before),
+      clubId ? eq(videos.clubId, clubId) : undefined,
+    ),
+    orderBy: asc(videos.updatedAt),
+    limit,
+  });
+
+export const findUploadingCreatedBefore = (
+  before: Date,
+  limit: number,
+  clubId?: string,
+): Promise<Video[]> =>
+  db.query.videos.findMany({
+    where: and(
+      eq(videos.status, 'UPLOADING'),
+      lt(videos.createdAt, before),
+      clubId ? eq(videos.clubId, clubId) : undefined,
+    ),
+    orderBy: asc(videos.createdAt),
+    limit,
+  });
 
 export const transition = async (
   id: string,
