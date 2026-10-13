@@ -1153,6 +1153,8 @@ Chaining vs flow is a common confusion. A flow parent **waits for every child**.
 | **12** AI captions (optional) | Extract audio → Whisper → VTT → add subtitles to master | Chain from READY, or a small flow (`audio` child → `captions` parent) | Captions must not gate playback; a flow only makes sense *within* the caption pipeline |
 | **Phase 2** | Several worker machines, long videos | Flow with dynamic children (one rendition per child), or segment-level parallel encoding | Only now does parallelism across machines beat one FFmpeg run |
 
+Measured in Sprint 6 ([transcoding.md, section 9](transcoding.md#9-one-job-or-a-flow-measured)): one FFmpeg run for all three renditions took 46 s; three separate runs, as three flow children would do, took 123–139 s, mostly because each one decodes the 4K source again.
+
 So: **flows are a real option, but not for the core transcode yet.** The first place they will likely earn their keep is captions (Sprint 12) or multi-machine transcoding (Phase 2).
 
 ## Gotchas checklist
