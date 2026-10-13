@@ -6,7 +6,7 @@ How KlyroStream moves slow work (transcoding, emails, captions) out of HTTP requ
 
 1. [Fundamentals](#part-1-fundamentals): the problem, queues, BullMQ, workers, how a job is processed, concurrency, limits, durability
 2. [BullMQ vs RabbitMQ vs Kafka](#part-2-bullmq-vs-rabbitmq-vs-kafka)
-3. [What KlyroStream built in Sprint 5](#part-3-what-klyrostream-built-in-sprint-5): connections, queue, worker, shutdown, Bull Board, recovery scripts, measurements
+3. [What KlyroStream built in Sprint 5](#part-3-what-klyrostream-built-in-sprint-5): the whole flow on one page, the three locks, connections, `enqueueTranscode` (Promise.race + AbortController), the transactional outbox, the worker and its stub, `WORKER_CONCURRENCY`, shutdown, Bull Board, recovery scripts, measurements
 4. [Structuring multi-stage work](#part-4-structuring-multi-stage-work): single job, step job, flow, and why transcode + thumbnail is not a flow
 5. [The plan per sprint](#part-5-the-plan-for-klyrostream), gotchas, further reading
 
@@ -175,6 +175,62 @@ There is also `prioritized` (waiting, but sorted by priority) and `paused` (the 
 
 When a worker takes a job it gets a **lock** in Redis (`lockDuration`, default 30 s) and renews it every 15 s while the processor runs. If the worker process dies, the renewals stop, the lock expires, and a periodic check (`stalledInterval`, default 30 s) moves the job back to waiting so another worker can pick it up. After `maxStalledCount` (default 1) stalls it fails instead, so a job that crashes the worker every time can't loop forever.
 
+The lock is one plain Redis key holding a random token, with an expiry:
+
+```
+bull:video-processing:video-42:lock  =  "a1b2c3…:7"     PX 30000   (expires in 30 s)
+                                         └ token: which Worker, which slot
+```
+
+- `moveToActive` creates it (`SET … PX 30000`) in the same Lua script that moves the id from `wait` to `active`.
+- `extendLock` renews it **only if the token still matches** (`GET` = my token → `SET … PX 30000`).
+- `moveToFinished` also checks the token. If it doesn't match (the lock expired and someone else took the job), the late result is **rejected** ("Missing lock for job"), so a slow worker can't overwrite the newer run's outcome.
+
+#### Healthy job: the lock never expires
+
+```
+time  0s        15s        30s        45s        60s   72s
+      │          │          │          │          │     │
+lock  ├──30s TTL─┼──────────┤                            moveToActive sets the lock
+      │          ├──renew: 30s TTL from here──┤          worker renews every lockDuration/2
+      │          │          ├──renew──────────┼──┤
+      │          │          │          ├──renew──────────┼──┤
+      │                                                  │
+proc  ███████████████████████████████████████████████████│  returns at 72 s
+                                                         └─ moveToFinished: token ok → completed, lock deleted
+```
+
+The job can run for an hour. The lock only needs to outlive the gap between two renewals.
+
+#### Crashed worker: how the job is rescued
+
+The stalled check is a **two-pass mark-and-sweep**, run by every worker every `stalledInterval`:
+
+```
+ pass N  (sweep, then mark)
+   1. for each id in the `stalled` set: lock key gone?  → it's stalled: LREM active, stc+1, back to wait
+   2. copy every id currently in `active` into the `stalled` set        ("suspects")
+
+ meanwhile, every renewal (extendLock) does SREM stalled <id>          ("I'm alive, not a suspect")
+```
+
+A job that is renewed between two passes is removed from the suspects and survives. A job whose worker died is still a suspect at the next pass *and* has no lock, so it's moved back.
+
+```
+ t=0s    worker A takes job 42, lock TTL 30 s
+ t=10s   stalled check: 42 is active → added to suspects
+ t=15s   A renews → SREM suspects 42                        (alive)
+ t=20s   ✖ worker A is killed (kill -9, OOM, power loss)    renewals stop
+ t=40s   stalled check: suspects is empty → nothing swept; 42 still active → suspect again
+ t=45s   lock expires (last renew at 15 s + 30 s)
+ t=70s   stalled check: 42 is a suspect AND has no lock → moved to wait, stc=1, 'stalled' event
+ t=70s   worker B (or A, restarted) takes it from wait → runs it from the start
+```
+
+So a dead worker's job comes back after somewhere between ~30 s and ~60 s plus the remaining lock time. It doesn't use up one of the 3 `attempts`. Stalls are counted separately (`stc` on the job hash). With `maxStalledCount: 1`, the second stall marks it to fail with "job stalled more than allowable limit" when it is next picked up.
+
+This is the run that happened in the Sprint 5 test: double Ctrl+C mid-job, and the next worker recovered it about 30 s later.
+
 Renewal runs on the worker's event loop. If the processor blocks the loop (a long synchronous loop, heavy JSON parsing), renewals stop and a healthy job is marked stalled and **run twice**. FFmpeg runs in a child process via `spawn`, so the event loop stays free. Keep it that way.
 
 ### Delivery is at least once
@@ -294,6 +350,74 @@ POST /videos/:id/upload/complete              npm run dev:worker
 npm run videos:requeue-stuck ──▶ reconciles rows with jobs
 ```
 
+### The whole flow on one page
+
+One video, from the last uploaded part to READY, with every lock and every place it can break. Columns are the four things involved; time runs downward.
+
+```
+ CLIENT            API process                     POSTGRES                    REDIS                       WORKER process
+ ──────            ───────────                     ────────                    ─────                       ──────────────
+                                                                                                          new Worker(concurrency 1)
+                                                                                                          BZPOPMIN marker … (asleep)
+ POST /complete ─▶ completeVideoUpload
+                   BEGIN ───────────────────────▶ SELECT … FOR UPDATE   ◀── LOCK ①: row lock
+                                                  (a 2nd /complete waits here)
+                   S3 CompleteMultipartUpload
+                   check size
+                   UPDATE status = PROCESSING ──▶ row: PROCESSING
+                   COMMIT ──────────────────────▶ lock ① released
+                      ┊
+                      ┊  ✖ gap: crash here or Redis down → row PROCESSING, no job   (outbox closes this gap)
+                      ┊
+                   enqueueTranscode ──────────────────────────────────▶ Lua addStandardJob
+                   (raced against 2 s)                                  jobId video-42 exists? → stop
+                                                                        HSET job hash, LPUSH wait,
+                                                                        ZADD marker ─────────────────▶ wakes up
+ ◀── 200 PROCESSING (even if enqueue failed: logged, repaired by requeue-stuck)
+                                                                        Lua moveToActive  ◀────────── "give me a job"
+                                                                        wait → active
+                                                                        SET …:lock token PX 30000  ◀── LOCK ②: job lock
+                                                                        return job ─────────────────▶ processVideo(job)
+                                                   SELECT row  ◀───────────────────────────────────── re-read: PROCESSING?
+                                                                                                        no → UnrecoverableError
+                                                                        HSET progress 20…100 ◀──────── stub steps (Sprint 6: FFmpeg)
+                                                                        extendLock every 15 s ◀──────── (background timer)
+                                                   UPDATE … SET READY  ◀──────────────────────────────── markVideoReady
+                                                   WHERE status=PROCESSING  ◀── LOCK ③: conditional transition
+                                                                        Lua moveToFinished ◀──────────── return {status}
+                                                                        token ok? → completed, DEL lock
+                                                                        next job in wait? → hand it over
+ GET /videos/42 ─▶                                 row: READY
+```
+
+What happens on the error paths:
+
+```
+ processor throws ──▶ isFinalAttempt?
+                        │ no  (attempt 1 or 2, ordinary Error)
+                        │     → log "will retry", rethrow → BullMQ: delayed 5 s / 10 s → wait → active again
+                        │       row stays PROCESSING
+                        │ yes (attempt 3, or UnrecoverableError)
+                        │     → markVideoFailed: PROCESSING → ERROR (reason) → rethrow → BullMQ: failed
+ worker process dies ─▶ lock ② expires → stalled check → back to wait (no attempt used)
+ Redis down at enqueue ▶ 200 anyway, error logged → npm run videos:requeue-stuck enqueues it later
+```
+
+### The three locks, side by side
+
+"Locking" shows up three times in this flow. They protect different things and live in different places:
+
+| | ① Postgres row lock | ② BullMQ job lock | ③ Conditional transition |
+|---|---|---|---|
+| Where | Postgres, `SELECT … FOR UPDATE` in `withUploadLock` | Redis key `bull:video-processing:<jobId>:lock` | Postgres, `UPDATE … WHERE status = 'PROCESSING'` |
+| Protects against | two `/complete` (or `/complete` + abort + expire script) running at once on one video | two workers running one job at once | writing READY/ERROR over a row that changed meanwhile (deleted, already failed) |
+| Held for | milliseconds, until COMMIT | the whole job, renewed every 15 s | a single statement (it's atomic, not held) |
+| If the holder dies | Postgres releases it when the connection drops | expires after 30 s, stalled check rescues the job | nothing to release |
+| Kind | pessimistic (wait your turn) | lease (expires unless renewed) | optimistic (check-and-set, 0 rows = someone else won) |
+| Covered in | [locking.md](locking.md) | Part 1, *Locks and stalled jobs* | [locking.md](locking.md) |
+
+Plus the idempotent **jobId**, which isn't a lock but works like one at enqueue time: `addStandardJob` checks "does `video-42` exist?" and creates it in one atomic Lua script, so two enqueues can't both create a job.
+
 ### Connections: `src/lib/queue/connection.ts`
 
 BullMQ gets its own Redis connections, separate from the cache/rate-limit client in `src/lib/redis/client.ts`:
@@ -332,16 +456,125 @@ export const videoQueue = new Queue<TranscodeJob>(VIDEO_QUEUE, {
 });
 
 videoQueue.on('error', …); // without a listener, a Redis outage crashes the process
-
-export const enqueueTranscode = async (videoId: string, requestId?: string) =>
-  // add('transcode', { videoId, requestId }, { jobId: `video-${videoId}` }),
-  // raced against a 2 s timeout (see Connections above)
 ```
 
 - **Pointers, not state.** The payload is an id. The worker reads the current row from Postgres, never a snapshot from enqueue time.
 - **Idempotent id.** `video-<uuid>`, so a double `/complete` or a requeue script creates one job. Use `-`, not `:`, because `:` separates Redis key parts. Measured: adding the same id twice stores one job, and the stored `requestId` is the first one. The `Job` returned by the second `add()` shows the data you passed, not the stored data.
 - **The id only blocks while the job exists.** Once `removeOnComplete` evicts it (after 100 newer completions), the same id can be added again and runs again. A "re-process this video" feature should use a new id (e.g. `video-<uuid>-r2`) instead of relying on eviction timing.
-- **Enqueue after commit.** `completeVideoUpload` commits `UPLOADING → PROCESSING` first, then enqueues. Enqueueing inside the transaction could start a worker that reads the row *before* the commit and sees `UPLOADING`. If the enqueue fails after the commit, `/complete` still answers **200 PROCESSING** and logs `failed to enqueue transcode`. Returning an error would be worse: the client would retry, hit `409 UPLOAD_NOT_IN_PROGRESS` (the row is already PROCESSING), and conclude the upload failed when it didn't. The stuck video is repaired by `npm run videos:requeue-stuck` (below). The fully robust version, writing the job into a Postgres "outbox" table in the same transaction, is the *transactional outbox* pattern; it is out of scope for Phase 1.
+- **Enqueue after commit.** `completeVideoUpload` commits `UPLOADING → PROCESSING` first, then enqueues. Enqueueing inside the transaction could start a worker that reads the row *before* the commit and sees `UPLOADING`. If the enqueue fails after the commit, `/complete` still answers **200 PROCESSING** and logs `failed to enqueue transcode`. Returning an error would be worse: the client would retry, hit `409 UPLOAD_NOT_IN_PROGRESS` (the row is already PROCESSING), and conclude the upload failed when it didn't. The stuck video is repaired by `npm run videos:requeue-stuck` (below). The fully robust version is the [transactional outbox](#the-transactional-outbox-and-why-it-fits-here) (below); it is out of scope for Phase 1.
+
+### `enqueueTranscode`: Promise.race and AbortController
+
+```ts
+export const enqueueTranscode = async (videoId: string, requestId?: string) => {
+  const timeout = new AbortController();
+  try {
+    return await Promise.race([
+      videoQueue.add('transcode', { videoId, requestId }, { jobId: transcodeJobId(videoId) }),
+      sleep(ENQUEUE_TIMEOUT_MS, undefined, { signal: timeout.signal }).then(() => {
+        throw new Error(`Enqueue timed out after ${ENQUEUE_TIMEOUT_MS} ms`);
+      }),
+    ]);
+  } finally {
+    timeout.abort();
+  }
+};
+```
+
+**The problem it solves.** `videoQueue.add()` can, in one situation, hang without ever settling. When the API boots while Redis is down, the `Queue`'s one-time setup waits for Redis to connect, and every `add()` waits for that setup. That could take minutes. A `/complete` request must not hang that long just because the *follow-up* step is slow, so `add()` gets a 2-second deadline.
+
+(When Redis drops *after* boot, the producer connection has `enableOfflineQueue: false`, so `add()` rejects in ~1 ms by itself. The timeout only matters in the never-connected case.)
+
+**Piece by piece:**
+
+1. **`Promise.race([a, b])`** returns a promise that settles **the same way as whichever input settles first**: resolved with its value or rejected with its error. The other promise is *not* stopped; JavaScript promises can't be cancelled. The race just stops listening to it.
+2. **Promise `a`: `videoQueue.add(…)`** resolves with the `Job`, or rejects (Redis down, offline queue off).
+3. **Promise `b`: the timeout.** `sleep` is `setTimeout` from `node:timers/promises`: `sleep(2000)` is a promise that resolves after 2 s. The `.then(() => { throw … })` turns "2 s passed" into a *rejection* with a clear message. So `b` can never win with a value, only with "timed out".
+4. **`AbortController` + `{ signal }`.** The promise version of `setTimeout` accepts an abort signal. `timeout.abort()` clears the underlying timer and makes `sleep` reject with an `AbortError`.
+5. **`finally { timeout.abort() }`** runs on every way out: `add` won, `add` failed, or the timer won.
+
+**Why abort the timer at all?** Without it, every successful enqueue (which takes ~2 ms) would leave a 2-second timer behind. That timer keeps the process alive during shutdown, and under load you'd have thousands of pointless timers pending. Aborting cleans it up as soon as the race is decided.
+
+**Why no "unhandled rejection" from the loser?** When `abort()` makes `sleep` reject, `b` rejects too, *after* the race already settled. That's fine, because `Promise.race` attached its own handlers to both inputs when it was called. A rejection on a promise that has a handler is never "unhandled", even if the handler ignores it. The same goes for a late `add()` rejection.
+
+The three cases on a timeline:
+
+```
+ Redis up
+   0 ms   add() starts, sleep(2000) starts
+   2 ms   add() resolves ──▶ race resolves with the Job
+          finally: abort() → timer cleared, sleep rejects (AbortError, ignored)
+
+ Redis dropped after boot (offline queue off)
+   0 ms   add() starts, sleep(2000) starts
+   1 ms   add() rejects "Stream isn't writeable…" ──▶ race rejects
+          finally: abort() → timer cleared
+          caller: .catch → log "failed to enqueue transcode", still answer 200
+
+ Redis never up since boot
+   0 ms   add() starts (waits for the queue's setup), sleep(2000) starts
+ 2000 ms  sleep resolves → .then throws "Enqueue timed out" ──▶ race rejects
+          finally: abort() → no-op, the timer already fired
+          caller: .catch → log, answer 200
+   later  Redis comes up → the abandoned add() completes → the job IS created
+```
+
+That last line is surprising but harmless. The timeout gives up on *waiting*, not on the *write*. When Redis arrives, the pending `add()` goes through and the video gets processed anyway. If someone ran `requeue-stuck` meanwhile, the idempotent `jobId` makes the second add a no-op. This is why "fire, maybe twice" is safe here, and why an idempotent jobId matters.
+
+**The caller decides what a failure means.** `enqueueTranscode` just reports success or failure. `completeVideoUpload` catches the error and logs it, because the upload itself *did* succeed (see *Enqueue after commit* above).
+
+### The transactional outbox, and why it fits here
+
+**The problem: two writes, two systems, no shared transaction.** `/complete` makes two writes:
+
+1. Postgres: `UPLOADING → PROCESSING` (committed).
+2. Redis: "transcode video 42" (the job).
+
+No single transaction spans Postgres and Redis. Whichever order you choose, a crash between them leaves the two out of sync:
+
+| Order | Crash between the two writes leaves… | Result |
+|---|---|---|
+| Enqueue, then commit | a job for a row still `UPLOADING` (or rolled back) | worker runs too early, or for nothing |
+| **Commit, then enqueue** (ours) | a `PROCESSING` row with **no job** | video stuck forever, until someone notices |
+
+This is the classic **dual-write problem**. We picked the second order because its failure is *detectable*: a PROCESSING row that's been sitting there too long. `requeue-stuck` fixes it, but only when someone runs it.
+
+**The outbox pattern** removes the second write from the request entirely:
+
+```
+ API request                               Postgres (one transaction)
+ ───────────                               ─────────────────────────
+ BEGIN
+   UPDATE videos SET status='PROCESSING' ─▶ videos row
+   INSERT INTO outbox (type, payload)    ─▶ outbox row  {type:'transcode', videoId:42}
+ COMMIT  ← both rows exist, or neither. Atomic, because it's ONE database.
+ → 200
+
+ Relay (a loop in the worker, or its own process)
+ ─────
+ every ~1 s:
+   SELECT * FROM outbox WHERE sent_at IS NULL
+     ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED
+   for each: videoQueue.add(…, { jobId: `video-${videoId}` })   ─▶ Redis
+             UPDATE outbox SET sent_at = now()
+   (Redis down? leave the rows, try again next tick)
+```
+
+The trick: the request only writes to **one** system, Postgres, so it can use **one** transaction. Getting the message from Postgres to Redis becomes a separate, retryable background step. If the relay crashes after `add()` but before marking the row sent, it sends again next tick, so the relay is *at least once*, and the idempotent `jobId` turns the duplicate into a no-op. Every part of this flow can now fail and recover without a human.
+
+**Why it would be good here:**
+- No gap. A committed PROCESSING always gets its job eventually, with no "run the script" step.
+- `/complete` no longer depends on Redis at all: no 2 s timeout, no "200 but enqueue failed".
+- It generalises. Sprint 7's delete, emails and later events (`video.ready` → notify the club) all become "insert an outbox row in the same transaction".
+
+**What it costs:**
+- A new table, a relay loop, cleanup of sent rows, and monitoring for "relay is behind".
+- Extra latency: a job starts up to one polling interval later (or use Postgres `LISTEN/NOTIFY` to wake the relay early).
+- Ordering and concurrency details: `FOR UPDATE SKIP LOCKED` so two relays don't send the same rows.
+
+**Why Phase 1 doesn't need it: our `videos` table already is an outbox.** The row's own status is the record of pending work: "PROCESSING with no job" *is* an unsent outbox entry. `requeue-stuck` is a relay that a human runs, and it finds exactly those rows. Running it on a schedule (every few minutes, `--min-age-minutes 10`) gives nearly all of the outbox's benefit without a new table. A real outbox becomes worth it once several kinds of events need reliable delivery and no single status column describes them.
+
+(The industrial version replaces the polling relay with *change data capture*: a tool like Debezium reads Postgres's write-ahead log and publishes outbox inserts to Kafka.)
 
 ### Retries and the state machine
 
@@ -364,18 +597,141 @@ The processor (a Sprint 5 stub; Sprint 6 replaces the middle with FFmpeg):
 2. Report progress 20 → 100 (`job.updateProgress`), optionally failing on purpose (`FAIL_RATE`).
 3. `videoService.markVideoReady(id)`: a conditional `PROCESSING → READY`. Zero rows changed → `UnrecoverableError`.
 
+#### Why a stub, and what the stub steps are
+
+Sprint 5 is about the *plumbing*: enqueue, retry, fail, shut down, recover. FFmpeg (Sprint 6) brings its own problems (temp files, child processes, S3 streaming). Building both at once would make every bug ambiguous: is it the queue or the encoder? So the processor's "work" is fake, while everything around it is the real code Sprint 6 keeps.
+
+```ts
+const STUB_STEPS = 5;
+const STUB_STEP_MS = 500;
+
+for (let step = 1; step <= STUB_STEPS; step++) {
+  await sleep(STUB_STEP_MS);
+  if (step === 3 && Math.random() < env.FAIL_RATE) {
+    throw new Error('Simulated transient failure (FAIL_RATE)');
+  }
+  await job.updateProgress(Math.round((step / STUB_STEPS) * 100));
+}
+```
+
+- **5 steps × 500 ms = 2.5 s of "work".** Long enough to watch progress move in Bull Board and to press Ctrl+C mid-job when testing shutdown. Short enough that a test run doesn't drag.
+- **`await sleep(…)`, not a busy loop.** A real transcode is *waiting* from Node's point of view (FFmpeg is another process), so the stub waits too. That keeps the event loop free for lock renewal, just as FFmpeg will. It's also why `WORKER_CONCURRENCY=3` sped the stub up 2.7×: three waits overlap. Real encodes won't scale like that (see *Where FFmpeg fits*).
+- **`job.updateProgress(20 / 40 / 60 / 80 / 100)`** writes the number into the job hash and emits a `progress` event. Bull Board shows it as a bar. Sprint 6 will report FFmpeg's real `time=` progress, and Sprint 9 can push it to the browser.
+- **The failure is at step 3, not step 1**, on purpose: the job has *already reported 40%* when it fails. That shows what a retry really does: it starts over from zero (progress goes back to 20%). BullMQ doesn't resume. Sprint 6 must be able to restart cleanly (outputs to deterministic paths, temp dir wiped).
+- **`Math.random() < env.FAIL_RATE`.** `Math.random()` is uniform in [0, 1), so the condition is true with probability `FAIL_RATE`: 0 → never, 0.5 → half the attempts, 1 → always. Each *attempt* rolls independently, so with 3 attempts a video ends in ERROR with probability `FAIL_RATE³` (0.5 → 12.5%, which matched the 8-upload test).
+- **It throws a plain `Error`, not `UnrecoverableError`.** It simulates the *transient* kind (network blip), the kind retries exist for.
+
+#### `transcode` vs `processVideo`: work vs policy
+
+The file has two functions on purpose:
+
+| | `transcode(job, log)` | `processVideo(job)` |
+|---|---|---|
+| Job | do the work: check row, (stub) encode, mark READY | decide what a failure *means* |
+| Knows about retries? | no, it just throws | yes: final or not |
+| Sprint 6 changes it? | yes, the loop becomes FFmpeg | no |
+
+```ts
+export const processVideo = async (job: Job<TranscodeJob>) => {
+  const { videoId, requestId } = job.data;
+  const log = logger.child({ jobId: job.id, videoId, requestId, attempt: job.attemptsMade + 1 });
+
+  try {
+    return await transcode(job, log);
+  } catch (err) {
+    if (!isFinalAttempt(job, err)) {
+      log.warn({ err }, 'attempt failed, will retry');
+      throw err;
+    }
+    const reason = err instanceof Error ? err.message : 'Processing failed';
+    const failed = await videoService.markVideoFailed(videoId, reason).catch((markErr: unknown) => {
+      log.error({ err: markErr }, 'could not mark video as ERROR');
+      return undefined;
+    });
+    log.error({ err, markedError: Boolean(failed) }, 'processing failed for good');
+    throw err;
+  }
+};
+```
+
+- **`logger.child({...})`** makes a logger that stamps every line with jobId, videoId, the request id from the original `/complete` and the attempt number. One `grep requestId` follows a video from the HTTP request into the worker.
+- **`return await`**, not `return`, so a rejection from `transcode` is caught by *this* `try`. A plain `return transcode(…)` would hand the promise out of the function before it rejects, and the `catch` would never run.
+- **Always rethrow.** The processor's throw is how BullMQ learns the attempt failed. Swallowing the error would mark the job *completed*.
+- **`markVideoFailed(...).catch(...)`.** If Postgres is down at that moment, marking ERROR fails too. That second error is logged but not thrown, so BullMQ still records the *original* reason on the job. The row stays PROCESSING with a failed job, which is exactly the case `requeue-stuck` turns into ERROR later.
+
 Failure handling lives **in the processor**, not in a `failed` listener:
 
 ```ts
 const isFinalAttempt = (job: Job, err: unknown) =>
   err instanceof UnrecoverableError || job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
-// not final → log "will retry" and rethrow (row stays PROCESSING)
-// final     → markVideoFailed(id, reason) (only moves a PROCESSING row), then rethrow
 ```
 
-`attemptsMade` counts *finished* attempts, so it is 0 during the first one. Why not the worker's `failed` event, as the plan's reference code does? A `Worker` emits `failed` only for errors thrown by its own processor (checked in BullMQ's `worker.js`). A job that fails because it stalled too many times reaches neither place. Since neither covers everything, the processor keeps the decision next to its context, and the requeue script handles the rest.
+`attemptsMade` counts *finished* attempts, so it is 0 during the first one. With `attempts: 3`:
+
+| Attempt | `attemptsMade` during it | `attemptsMade + 1 >= 3`? | If it throws a plain Error |
+|---|---|---|---|
+| 1st | 0 | no | warn, rethrow → delayed 5 s |
+| 2nd | 1 | no | warn, rethrow → delayed 10 s |
+| 3rd | 2 | **yes** | mark ERROR, rethrow → failed |
+| any | – | (UnrecoverableError → final) | mark ERROR, rethrow → failed, no retries | Why not the worker's `failed` event, as the plan's reference code does? A `Worker` emits `failed` only for errors thrown by its own processor (checked in BullMQ's `worker.js`). A job that fails because it stalled too many times reaches neither place. Since neither covers everything, the processor keeps the decision next to its context, and the requeue script handles the rest.
 
 `FAIL_RATE` (0 to 1) makes that share of attempts throw a transient error. The env schema refuses a non-zero value in production.
+
+### `WORKER_CONCURRENCY`
+
+```ts
+WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(1),
+
+const videoWorker = new Worker<TranscodeJob>(VIDEO_QUEUE, processVideo, {
+  connection: queueConnection('worker'),
+  concurrency: env.WORKER_CONCURRENCY,
+});
+```
+
+It is BullMQ's `concurrency` option (see [Concurrency vs parallelism](#concurrency-vs-parallelism)) read from the environment: **how many jobs this one worker process runs at the same time.** It doesn't create threads or processes. One Node thread keeps N `processVideo` calls in flight, and they take turns whenever one of them `await`s.
+
+```
+ WORKER_CONCURRENCY=1                         WORKER_CONCURRENCY=3
+ ┌ worker process (1 thread) ┐                ┌ worker process (1 thread) ┐
+ │ slot 1: job A ███████     │                │ slot 1: job A ███████     │
+ │         job B        ████ │                │ slot 2: job B ███████     │
+ │         job C           … │                │ slot 3: job C ███████     │
+ └───────────────────────────┘                └───────────────────────────┘
+   Redis: B, C wait in `wait`                   3 locks held, 3 renewal timers
+```
+
+What each slot means in practice:
+- One more job taken from `wait` and moved to `active`, with its own lock and renewal.
+- `worker.close()` waits for **all** of them, so the 30 s shutdown budget has to cover the slowest.
+- In Sprint 6, each slot is one FFmpeg process, its RAM and its temp files. That's why it's an env var: the right number depends on the machine, not the code.
+
+The schema details:
+- **`z.coerce.number()`.** Env vars are always strings; `"3"` becomes `3`. `"abc"` fails at boot instead of becoming `NaN`.
+- **`.int().min(1)`.** `0` would make a worker that never takes a job, and `2.5` is meaningless.
+- **`.max(16)`.** A sanity cap. A typo like `100` would start 100 FFmpegs on one machine and take it down. Going above 16 should be a deliberate code change.
+- **`.default(1)`.** CPU-bound video work: FFmpeg already uses every core.
+
+How to change it:
+
+```bash
+# backend/.env
+WORKER_CONCURRENCY=3
+# or for one run (PowerShell)
+$env:WORKER_CONCURRENCY=3; npm run dev:worker
+```
+
+The `worker ready` log line prints the value in use. Measured with the 2.5 s stub and 3 jobs: `1` → 7.8 s, `3` → 2.9 s.
+
+**Concurrency or more processes?**
+
+| Want | Use |
+|---|---|
+| More jobs that mostly *wait* (emails, HTTP calls) | raise `concurrency` |
+| More CPU work (encoding) on a machine with spare cores | maybe `concurrency: 2`, *measure* (Sprint 11) |
+| More CPU work than one machine has | more worker processes on more machines, each `concurrency: 1` |
+| A cap across *all* workers (e.g. an external API limit) | `queue.setGlobalConcurrency(n)` or a `limiter`, not this |
+
+The API process ignores this variable; only `worker.ts` reads it.
 
 ### Graceful shutdown
 
