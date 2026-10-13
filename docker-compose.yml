@@ -48,6 +48,31 @@ services:
       timeout: 3s
       retries: 10
 
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    profiles: [worker]
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 40s
+    env_file: ./backend/.env
+    environment:
+      NODE_ENV: production
+      FAIL_RATE: '0'
+      DATABASE_URL: postgresql://klyro:klyro_dev@postgres:5432/klyro
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://rustfs:9000
+      SMTP_HOST: mailpit
+      SMTP_PORT: '1025'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   redis_data:
