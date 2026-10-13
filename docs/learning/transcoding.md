@@ -467,10 +467,61 @@ flowchart LR
 | 1. Container with FFmpeg | Done | `backend/Dockerfile` (`worker` target), `docker-compose.yml` (`worker` service, `profiles: [worker]`) |
 | 2. Download + probe | Done | `lib/storage/objects.ts`, `worker/pipeline/download.ts`, `worker/pipeline/probe.ts` |
 | 3. Transcode | Done | `worker/pipeline/transcode.ts`: `planRenditions`, `buildHlsArgs` (pure), `runFfmpeg` (`spawn`, progress, stop on abort), `transcodeHls` |
-| 4. Thumbnail | Next | |
-| 5. Upload outputs | | Content types: `.m3u8` → `application/vnd.apple.mpegurl`, `.ts` → `video/mp2t` |
-| 6. Wire the processor | | Temp dir, weighted progress, READY/ERROR, SIGTERM stops FFmpeg |
+| 4. Thumbnail | Done | `worker/pipeline/thumbnail.ts`: `thumbnailTime`, `makeThumbnail` |
+| 5. Upload outputs | Done | `lib/storage/objects.ts` (`uploadObject`), `worker/pipeline/upload.ts` (`uploadDir`, `uploadFile`, `contentTypeFor`) |
+| 6. Wire the processor | Next | Temp dir, weighted progress, READY/ERROR, SIGTERM stops FFmpeg, the "uploaded" checkpoint |
 | 7. Prove it | | hls.js with a throttled network, "minutes per GB" |
+
+### Thumbnail (Stage 4)
+
+```text
+ffmpeg -y -ss 5.000 -i source -frames:v 1
+       -vf "scale='min(640,iw)':'min(640,ih)':force_original_aspect_ratio=decrease"
+       -q:v 3 thumbnail.jpg
+```
+
+| Part | Why |
+|---|---|
+| `-ss 5` **before** `-i` | Input seeking: FFmpeg jumps to the nearest keyframe before 5 s and decodes only from there. After `-i` it would decode every frame from 0 s |
+| 5 s, or 10% for clips ≤ 10 s | Frame 0 is often black or a fade-in. A 3 s clip has no 5 s mark, so it uses 0.3 s |
+| `-frames:v 1` | Write one frame and stop |
+| `scale=…min(640,…)…decrease` | Fit inside a 640×640 box, keep the shape, never upscale: landscape → 640×360, portrait → 360×640 |
+| `-q:v 3` | JPEG quality (2 = best, 31 = worst); 3 keeps a 640×360 frame around 40 KB |
+
+It reuses `runFfmpeg`, so it gets the same no-shell spawn, error classification and abort support.
+
+Measured: 4K sample at 5.00 s → 640×360 in 1.5 s; portrait clip at 0.30 s → 360×640, upright; 2 s clip at 0.20 s.
+
+### Upload (Stage 5)
+
+The player trusts the `Content-Type` header, not the file extension. Safari's native HLS player and some TVs refuse a playlist served as `application/octet-stream` (what you get when no type is set). So every object gets its type at upload time:
+
+| Extension | Content-Type |
+|---|---|
+| `.m3u8` | `application/vnd.apple.mpegurl` |
+| `.ts` | `video/mp2t` |
+| `.jpg` | `image/jpeg` |
+
+An unknown extension is an error, and `uploadDir` checks every file **before** uploading any, so a stray file can't cause a half-uploaded folder.
+
+**Keys:** `hls-output/<videoId>/master.m3u8`, `hls-output/<videoId>/720p/seg_000.ts`, `thumbnails/<videoId>.jpg`. The folder layout is uploaded unchanged, so the relative paths inside the playlists keep working. On Windows, `path.relative` returns `720p\seg_000.ts`; the key is rebuilt with `/`, because S3 keys always use forward slashes.
+
+**Concurrency without a library.** `uploadDir` starts 4 small loops that each take the next file from a shared index until none are left. Node runs them on one thread, so `files[next++]` never hands the same file to two loops. Plain `PutObject` is enough because the largest file is a ~3.5 MB segment; multipart only pays off for large objects. The first failure sets a flag that stops the other loops, so no upload lands after the job has given up.
+
+**A bug found by measuring.** The first version reported 12.2 MB uploaded for a 36.7 MB folder:
+
+```ts
+bytes += await uploadFile(file, bucket, key);     // wrong with concurrency
+```
+
+`a += await b` means `a = a + await b`, and `a` is read **before** the `await`. Four loops all read the same old total, wait, then each writes "old total + my file", overwriting the others. All 22 files were uploaded; only the count was lost. It's the same lost-update race as two transactions doing read-modify-write without a lock ([locking.md](locking.md)). The fix is to await first, then add:
+
+```ts
+const size = await uploadFile(file, bucket, key);
+bytes += size;
+```
+
+Measured after the fix: 22 files, 36.7 MB, uploaded in 0.55–0.68 s. Fetching through a presigned URL returned `application/vnd.apple.mpegurl` for `master.m3u8` and `video/mp2t` for `720p/seg_000.ts`.
 
 **Download speed, for the record:** the 229 MB raw object streamed from RustFS to disk in 1.2–2.5 s. The transcode (46 s for 32 s of 4K) is roughly 20–40× the download, so the download is not worth optimising.
 
