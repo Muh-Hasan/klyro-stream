@@ -6,7 +6,7 @@ How KlyroStream moves slow work (transcoding, emails, captions) out of HTTP requ
 
 1. [Fundamentals](#part-1-fundamentals): the problem, queues, BullMQ, workers, how a job is processed, concurrency, limits, durability
 2. [BullMQ vs RabbitMQ vs Kafka](#part-2-bullmq-vs-rabbitmq-vs-kafka)
-3. [What KlyroStream built in Sprint 5](#part-3-what-klyrostream-built-in-sprint-5): the whole flow on one page, the three locks, connections, `enqueueTranscode` (Promise.race + AbortController), the transactional outbox, the worker and its stub, `WORKER_CONCURRENCY` and how jobs are shared between workers, shutdown, Bull Board, recovery scripts, measurements
+3. [What KlyroStream built in Sprint 5](#part-3-what-klyrostream-built-in-sprint-5): the whole flow on one page, the three locks, connections, `enqueueTranscode` (Promise.race + AbortController), the transactional outbox, the worker and its stub, `FAIL_RATE` fault injection, `WORKER_CONCURRENCY` and how jobs are shared between workers, shutdown, Bull Board, recovery scripts, measurements
 4. [Structuring multi-stage work](#part-4-structuring-multi-stage-work): single job, step job, flow, and why transcode + thumbnail is not a flow
 5. [The plan per sprint](#part-5-the-plan-for-klyrostream), gotchas, further reading
 
@@ -27,9 +27,10 @@ Transcoding a 1 GB video takes minutes of CPU. If `POST /videos/:id/complete` di
 
 A restaurant. The waiter (API) takes an order, writes a ticket, pins it on the rail, and goes back to the customers. The cooks (workers) take tickets off the rail one by one and cook. The waiter never waits at the stove, and if one cook goes home the tickets are still on the rail for the next one.
 
-```
- producer ──add job──▶ [ queue: job5 job4 job3 ] ──take job──▶ consumer
- (the API)              (stored somewhere durable)              (the worker)
+```mermaid
+flowchart LR
+    P["Producer<br/>(the API)"] -->|"add job"| Q[["Queue: job5 · job4 · job3<br/>(stored somewhere durable)"]]
+    Q -->|"take job"| C["Consumer<br/>(the worker)"]
 ```
 
 - The **producer** only says *what* needs doing ("transcode video 42") and moves on.
@@ -42,20 +43,22 @@ This *decouples* the two sides in time (the work happens later), in speed (spike
 
 BullMQ is **an npm library, not a server.** There is no "BullMQ process" running anywhere. The server is **Redis**, which already runs in our Compose stack. BullMQ is code that runs *inside your Node processes* and stores the queue as Redis keys.
 
-```
-   API process (node server.js)              Worker process (node worker.js)
-   ┌───────────────────────────┐             ┌───────────────────────────┐
-   │ Express routes            │             │ BullMQ Worker             │
-   │ BullMQ Queue  ── add() ─┐ │             │   └─ processVideo(job)    │
-   └─────────────────────────┼─┘             └──────────▲────────────────┘
-                             │                          │ take job, report result
-                             ▼                          │
-                 ┌──────────────────────────────────────┴──┐
-                 │ Redis: bull:video-processing:wait        │
-                 │        bull:video-processing:active      │
-                 │        bull:video-processing:video-<id>  │  (one hash per job)
-                 │        …                                 │
-                 └──────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph API["API process (node server.js)"]
+        ER["Express routes"] --> QA["BullMQ Queue"]
+    end
+    subgraph RD["Redis"]
+        K1["bull:video-processing:wait"]
+        K2["bull:video-processing:active"]
+        K3["bull:video-processing:video-#lt;id#gt;<br/>(one hash per job)"]
+    end
+    subgraph WK["Worker process (node worker.js)"]
+        BW["BullMQ Worker"] --> PV["processVideo(job)"]
+    end
+    QA -->|"add()"| RD
+    RD -->|"take job"| BW
+    BW -->|"report result"| RD
 ```
 
 The two processes never call each other. Redis is the only thing between them.
@@ -118,29 +121,25 @@ It would work, since a `Worker` is just an object. We don't do it, because:
 
 What actually happens between `add()` and "completed":
 
-```
- API                         Redis                                   Worker process
- ───                         ─────                                   ──────────────
- queue.add('transcode',      Lua script (atomic):                    blocked on BZPOPMIN(marker)
-   {videoId}, {jobId})  ───▶  - job id already exists? → stop          (asleep, using no CPU)
-                              - HSET job hash (data, opts)
-                              - LPUSH id onto  …:wait
-                              - ZADD  …:marker  ───────────────────▶ wakes up
-                                                                    │
-                             Lua moveToActive (atomic):  ◀──────────┤ "give me a job"
-                              - move id  wait → active              │
-                              - SET lock key (token, 30 s TTL)      │
-                              - return job data ───────────────────▶│ processor(job) runs
-                                                                    │   job.updateProgress(40) → HSET + event
-                             lock renewed every 15 s  ◀─────────────┤   (in the background)
-                                                                    │ processor returns / throws
-                             Lua moveToFinished (atomic):  ◀────────┤
-                              - remove from active, drop lock
-                              - success → …:completed (+ return value)
-                              - error, attempts left → …:delayed (backoff)
-                              - error, no attempts left → …:failed
-                              - emit event; trim per removeOnComplete/Fail
-                              - hand back the NEXT waiting job ────▶ start it right away
+```mermaid
+sequenceDiagram
+    participant API
+    participant R as Redis
+    participant W as Worker process
+    Note over W: blocked on BZPOPMIN(marker)<br/>asleep, using no CPU
+    API->>R: queue.add('transcode', {videoId}, {jobId})
+    Note over R: Lua addStandardJob (atomic)<br/>job id already exists? → stop<br/>HSET job hash (data, opts)<br/>LPUSH id onto wait<br/>ZADD marker
+    R-->>W: marker set → wakes up
+    W->>R: give me a job
+    Note over R: Lua moveToActive (atomic)<br/>move id wait → active<br/>SET lock key (token, 30 s TTL)
+    R-->>W: job data → processor(job) runs
+    loop while the processor runs
+        W->>R: job.updateProgress(40) → HSET + event
+        W->>R: renew the lock every 15 s (background)
+    end
+    W->>R: processor returns / throws
+    Note over R: Lua moveToFinished (atomic)<br/>remove from active, drop lock<br/>success → completed (+ return value)<br/>error, attempts left → delayed (backoff)<br/>error, no attempts left → failed<br/>emit event, trim per removeOnComplete/Fail
+    R-->>W: the NEXT waiting job → start it right away
 ```
 
 Points worth noticing:
@@ -152,21 +151,20 @@ Points worth noticing:
 
 ### Job states
 
-```
-                add()
-                  │
-      ┌───────────┼───────────────┐
-      ▼           ▼               ▼
-   waiting     delayed      waiting-children        (flow parents start here)
-      │           │ (time       │ (all children
-      │           │  passes)    │  finished)
-      │◀──────────┘◀────────────┘
-      ▼
-   active ── processor throws, attempts left ──▶ delayed (backoff) ──▶ waiting
-      │
-      ├── processor returns ─────────────────▶ completed
-      └── throws on last attempt, or
-          throws UnrecoverableError ─────────▶ failed
+```mermaid
+stateDiagram-v2
+    state "waiting-children" as waiting_children
+    [*] --> waiting: add()
+    [*] --> delayed: add() with a delay
+    [*] --> waiting_children: flow parents start here
+    delayed --> waiting: time passes
+    waiting_children --> waiting: all children finished
+    waiting --> active: a worker takes it
+    active --> delayed: throws, attempts left (backoff)
+    active --> completed: processor returns
+    active --> failed: throws on the last attempt, or UnrecoverableError
+    completed --> [*]
+    failed --> [*]
 ```
 
 There is also `prioritized` (waiting, but sorted by priority) and `paused` (the queue is paused).
@@ -188,16 +186,20 @@ bull:video-processing:video-42:lock  =  "a1b2c3…:7"     PX 30000   (expires in
 
 #### Healthy job: the lock never expires
 
-```
-time  0s        15s        30s        45s        60s   72s
-      │          │          │          │          │     │
-lock  ├──30s TTL─┼──────────┤                            moveToActive sets the lock
-      │          ├──renew: 30s TTL from here──┤          worker renews every lockDuration/2
-      │          │          ├──renew──────────┼──┤
-      │          │          │          ├──renew──────────┼──┤
-      │                                                  │
-proc  ███████████████████████████████████████████████████│  returns at 72 s
-                                                         └─ moveToFinished: token ok → completed, lock deleted
+```mermaid
+gantt
+    title Healthy job - the lock is renewed every 15 s, the job runs 72 s
+    dateFormat X
+    axisFormat %M:%S
+    section Lock (30 s TTL)
+    moveToActive sets the lock :0, 30s
+    renew at 15 s :15, 30s
+    renew at 30 s :30, 30s
+    renew at 45 s :45, 30s
+    renew at 60 s :60, 30s
+    section Processor
+    processVideo runs :0, 72s
+    moveToFinished - token ok, completed, lock deleted :milestone, 72, 0s
 ```
 
 The job can run for an hour. The lock only needs to outlive the gap between two renewals.
@@ -206,25 +208,38 @@ The job can run for an hour. The lock only needs to outlive the gap between two 
 
 The stalled check is a **two-pass mark-and-sweep**, run by every worker every `stalledInterval`:
 
-```
- pass N  (sweep, then mark)
-   1. for each id in the `stalled` set: lock key gone?  → it's stalled: LREM active, stc+1, back to wait
-   2. copy every id currently in `active` into the `stalled` set        ("suspects")
-
- meanwhile, every renewal (extendLock) does SREM stalled <id>          ("I'm alive, not a suspect")
+```mermaid
+flowchart LR
+    SET[("stalled set<br/>(suspects)")]
+    subgraph PASS["stalled check: every 30 s, on every worker"]
+        direction TB
+        S1{"1 · sweep<br/>suspect has no lock key?"} -->|"yes"| MV["stalled: LREM active,<br/>stc+1, back to wait"]
+        S1 -->|"no"| KEEP["alive, leave it"]
+        MV --> S2["2 · mark<br/>copy every id now in active"]
+        KEEP --> S2
+    end
+    SET -->|"read"| S1
+    S2 -->|"SADD"| SET
+    REN["every lock renewal<br/>(extendLock, every 15 s)"] -->|"SREM id: I'm alive, not a suspect"| SET
 ```
 
 A job that is renewed between two passes is removed from the suspects and survives. A job whose worker died is still a suspect at the next pass *and* has no lock, so it's moved back.
 
-```
- t=0s    worker A takes job 42, lock TTL 30 s
- t=10s   stalled check: 42 is active → added to suspects
- t=15s   A renews → SREM suspects 42                        (alive)
- t=20s   ✖ worker A is killed (kill -9, OOM, power loss)    renewals stop
- t=40s   stalled check: suspects is empty → nothing swept; 42 still active → suspect again
- t=45s   lock expires (last renew at 15 s + 30 s)
- t=70s   stalled check: 42 is a suspect AND has no lock → moved to wait, stc=1, 'stalled' event
- t=70s   worker B (or A, restarted) takes it from wait → runs it from the start
+```mermaid
+sequenceDiagram
+    participant A as Worker A
+    participant R as Redis
+    participant C as Stalled check
+    participant B as Worker B
+    A->>R: t=0s take job 42, lock TTL 30 s
+    C->>R: t=10s 42 is active → added to suspects
+    A->>R: t=15s renew → SREM suspects 42 (alive)
+    Note over A: t=20s ✖ killed (kill -9, OOM, power loss)<br/>renewals stop
+    C->>R: t=40s suspects empty → nothing swept<br/>42 still active → suspect again
+    Note over R: t=45s lock expires (last renew at 15 s + 30 s)
+    C->>R: t=70s 42 is a suspect AND has no lock<br/>→ moved to wait, stc=1, 'stalled' event
+    B->>R: t=70s takes job 42 from wait
+    Note over B: runs it from the start
 ```
 
 So a dead worker's job comes back after somewhere between ~30 s and ~60 s plus the remaining lock time. It doesn't use up one of the 3 `attempts`. Stalls are counted separately (`stc` on the job hash). With `maxStalledCount: 1`, the second stall marks it to fail with "job stalled more than allowable limit" when it is next picked up.
@@ -340,67 +355,74 @@ Being able to say *why not* Kafka is a good interview answer. "Kafka is a log fo
 
 # Part 3: What KlyroStream built in Sprint 5
 
-```
-POST /videos/:id/upload/complete              npm run dev:worker
-  ├─ lock row, UPLOADING → PROCESSING           └─ Worker (WORKER_CONCURRENCY)
-  ├─ commit                                          └─ processVideo(job)
-  └─ enqueueTranscode ──▶ Redis ◀─────────────────────  re-read row, require PROCESSING
-                         (video-processing)             progress → PROCESSING → READY
-/admin/queues (Bull Board) ──▶ reads / controls         last attempt failed → ERROR
-npm run videos:requeue-stuck ──▶ reconciles rows with jobs
+```mermaid
+flowchart LR
+    subgraph API["API process"]
+        C["POST /videos/:id/upload/complete<br/>lock row, UPLOADING → PROCESSING<br/>commit"]
+        BB["Bull Board at /admin/queues"]
+    end
+    Q[("Redis<br/>video-processing")]
+    subgraph WK["npm run dev:worker"]
+        W["Worker (WORKER_CONCURRENCY)<br/>processVideo(job)<br/>re-read row, require PROCESSING<br/>progress → READY<br/>last attempt failed → ERROR"]
+    end
+    C -->|"enqueueTranscode"| Q
+    Q --> W
+    BB -->|"reads / controls"| Q
+    RS["npm run videos:requeue-stuck"] -->|"reconciles rows with jobs"| Q
 ```
 
 ### The whole flow on one page
 
 One video, from the last uploaded part to READY, with every lock and every place it can break. Columns are the four things involved; time runs downward.
 
-```
- CLIENT            API process                     POSTGRES                    REDIS                       WORKER process
- ──────            ───────────                     ────────                    ─────                       ──────────────
-                                                                                                          new Worker(concurrency 1)
-                                                                                                          BZPOPMIN marker … (asleep)
- POST /complete ─▶ completeVideoUpload
-                   BEGIN ───────────────────────▶ SELECT … FOR UPDATE   ◀── LOCK ①: row lock
-                                                  (a 2nd /complete waits here)
-                   S3 CompleteMultipartUpload
-                   check size
-                   UPDATE status = PROCESSING ──▶ row: PROCESSING
-                   COMMIT ──────────────────────▶ lock ① released
-                      ┊
-                      ┊  ✖ gap: crash here or Redis down → row PROCESSING, no job   (outbox closes this gap)
-                      ┊
-                   enqueueTranscode ──────────────────────────────────▶ Lua addStandardJob
-                   (raced against 2 s)                                  jobId video-42 exists? → stop
-                                                                        HSET job hash, LPUSH wait,
-                                                                        ZADD marker ─────────────────▶ wakes up
- ◀── 200 PROCESSING (even if enqueue failed: logged, repaired by requeue-stuck)
-                                                                        Lua moveToActive  ◀────────── "give me a job"
-                                                                        wait → active
-                                                                        SET …:lock token PX 30000  ◀── LOCK ②: job lock
-                                                                        return job ─────────────────▶ processVideo(job)
-                                                   SELECT row  ◀───────────────────────────────────── re-read: PROCESSING?
-                                                                                                        no → UnrecoverableError
-                                                                        HSET progress 20…100 ◀──────── stub steps (Sprint 6: FFmpeg)
-                                                                        extendLock every 15 s ◀──────── (background timer)
-                                                   UPDATE … SET READY  ◀──────────────────────────────── markVideoReady
-                                                   WHERE status=PROCESSING  ◀── LOCK ③: conditional transition
-                                                                        Lua moveToFinished ◀──────────── return {status}
-                                                                        token ok? → completed, DEL lock
-                                                                        next job in wait? → hand it over
- GET /videos/42 ─▶                                 row: READY
+```mermaid
+sequenceDiagram
+    participant CL as Client
+    participant API as API process
+    participant PG as Postgres
+    participant R as Redis
+    participant W as Worker process
+    Note over W: new Worker(concurrency 1)<br/>BZPOPMIN marker (asleep)
+    CL->>API: POST /complete
+    rect rgba(255, 170, 0, 0.15)
+    API->>PG: BEGIN, SELECT … FOR UPDATE
+    Note over PG: LOCK ① row lock<br/>a 2nd /complete waits here
+    API->>API: S3 CompleteMultipartUpload, check size
+    API->>PG: UPDATE status = PROCESSING
+    API->>PG: COMMIT (lock ① released)
+    end
+    Note over API: ✖ gap: a crash here or Redis down<br/>→ row PROCESSING, no job (the outbox closes this gap)
+    API->>R: enqueueTranscode (raced against 2 s)
+    Note over R: Lua addStandardJob<br/>jobId video-42 exists? → stop<br/>HSET job hash, LPUSH wait, ZADD marker
+    R-->>W: marker → wakes up
+    API-->>CL: 200 PROCESSING<br/>(even if enqueue failed: logged, repaired by requeue-stuck)
+    W->>R: give me a job
+    rect rgba(0, 150, 255, 0.12)
+    Note over R: Lua moveToActive: wait → active<br/>SET …:lock token PX 30000 = LOCK ② job lock
+    R-->>W: job
+    W->>PG: re-read row: PROCESSING? (no → UnrecoverableError)
+    loop stub steps (Sprint 6: FFmpeg)
+        W->>R: HSET progress 20…100
+        W->>R: extendLock every 15 s (background timer)
+    end
+    W->>PG: UPDATE … SET READY WHERE status = PROCESSING
+    Note over PG: LOCK ③ conditional transition
+    W->>R: moveToFinished with {status}
+    Note over R: token ok? → completed, DEL lock<br/>next job in wait? → hand it over
+    end
+    CL->>API: GET /videos/42
+    API->>PG: SELECT → row: READY
 ```
 
 What happens on the error paths:
 
-```
- processor throws ──▶ isFinalAttempt?
-                        │ no  (attempt 1 or 2, ordinary Error)
-                        │     → log "will retry", rethrow → BullMQ: delayed 5 s / 10 s → wait → active again
-                        │       row stays PROCESSING
-                        │ yes (attempt 3, or UnrecoverableError)
-                        │     → markVideoFailed: PROCESSING → ERROR (reason) → rethrow → BullMQ: failed
- worker process dies ─▶ lock ② expires → stalled check → back to wait (no attempt used)
- Redis down at enqueue ▶ 200 anyway, error logged → npm run videos:requeue-stuck enqueues it later
+```mermaid
+flowchart TD
+    T["processor throws"] --> F{"isFinalAttempt?"}
+    F -->|"no: attempt 1 or 2, ordinary Error"| RETRY["log 'will retry', rethrow<br/>BullMQ: delayed 5 s / 10 s → wait → active again<br/>row stays PROCESSING"]
+    F -->|"yes: attempt 3, or UnrecoverableError"| FAIL["markVideoFailed: PROCESSING → ERROR (reason)<br/>rethrow → BullMQ: failed"]
+    D["worker process dies"] --> ST["lock ② expires → stalled check<br/>→ back to wait (no attempt used)"]
+    RD["Redis down at enqueue"] --> OK["200 anyway, error logged<br/>→ npm run videos:requeue-stuck enqueues it later"]
 ```
 
 ### The three locks, side by side
@@ -499,24 +521,37 @@ export const enqueueTranscode = async (videoId: string, requestId?: string) => {
 
 The three cases on a timeline:
 
-```
- Redis up
-   0 ms   add() starts, sleep(2000) starts
-   2 ms   add() resolves ──▶ race resolves with the Job
-          finally: abort() → timer cleared, sleep rejects (AbortError, ignored)
-
- Redis dropped after boot (offline queue off)
-   0 ms   add() starts, sleep(2000) starts
-   1 ms   add() rejects "Stream isn't writeable…" ──▶ race rejects
-          finally: abort() → timer cleared
-          caller: .catch → log "failed to enqueue transcode", still answer 200
-
- Redis never up since boot
-   0 ms   add() starts (waits for the queue's setup), sleep(2000) starts
- 2000 ms  sleep resolves → .then throws "Enqueue timed out" ──▶ race rejects
-          finally: abort() → no-op, the timer already fired
-          caller: .catch → log, answer 200
-   later  Redis comes up → the abandoned add() completes → the job IS created
+```mermaid
+sequenceDiagram
+    participant C as completeVideoUpload
+    participant E as enqueueTranscode (race)
+    participant A as add()
+    participant T as sleep(2000)
+    rect rgba(0, 200, 0, 0.1)
+    Note over C,T: Case 1 · Redis up
+    E->>A: start (0 ms)
+    E->>T: start (0 ms)
+    A-->>E: resolves at 2 ms → race resolves with the Job
+    E->>T: finally abort() → timer cleared (AbortError ignored)
+    E-->>C: Job
+    end
+    rect rgba(255, 170, 0, 0.12)
+    Note over C,T: Case 2 · Redis dropped after boot (offline queue off)
+    E->>A: start
+    E->>T: start
+    A-->>E: rejects at 1 ms, Stream isn't writeable → race rejects
+    E->>T: finally abort() → timer cleared
+    E-->>C: error → .catch logs, still answers 200
+    end
+    rect rgba(255, 0, 0, 0.1)
+    Note over C,T: Case 3 · Redis never up since boot
+    E->>A: start (waits for the queue's setup)
+    E->>T: start
+    T-->>E: resolves at 2000 ms → .then throws Enqueue timed out → race rejects
+    E->>T: finally abort() → no-op, the timer already fired
+    E-->>C: error → .catch logs, still answers 200
+    Note over A: later: Redis comes up →<br/>the abandoned add() completes → the job IS created
+    end
 ```
 
 That last line is surprising but harmless. The timeout gives up on *waiting*, not on the *write*. When Redis arrives, the pending `add()` goes through and the video gets processed anyway. If someone ran `requeue-stuck` meanwhile, the idempotent `jobId` makes the second add a no-op. This is why "fire, maybe twice" is safe here, and why an idempotent jobId matters.
@@ -541,23 +576,26 @@ This is the classic **dual-write problem**. We picked the second order because i
 
 **The outbox pattern** removes the second write from the request entirely:
 
-```
- API request                               Postgres (one transaction)
- ───────────                               ─────────────────────────
- BEGIN
-   UPDATE videos SET status='PROCESSING' ─▶ videos row
-   INSERT INTO outbox (type, payload)    ─▶ outbox row  {type:'transcode', videoId:42}
- COMMIT  ← both rows exist, or neither. Atomic, because it's ONE database.
- → 200
-
- Relay (a loop in the worker, or its own process)
- ─────
- every ~1 s:
-   SELECT * FROM outbox WHERE sent_at IS NULL
-     ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED
-   for each: videoQueue.add(…, { jobId: `video-${videoId}` })   ─▶ Redis
-             UPDATE outbox SET sent_at = now()
-   (Redis down? leave the rows, try again next tick)
+```mermaid
+sequenceDiagram
+    participant API as API request
+    participant PG as Postgres
+    participant RL as Relay (loop in the worker, or its own process)
+    participant R as Redis
+    rect rgba(0, 150, 255, 0.12)
+    Note over API,PG: ONE transaction in ONE database: both rows exist, or neither
+    API->>PG: BEGIN
+    API->>PG: UPDATE videos SET status='PROCESSING'
+    API->>PG: INSERT INTO outbox (type, payload)<br/>{type: 'transcode', videoId: 42}
+    API->>PG: COMMIT
+    end
+    Note over API: → 200
+    loop every ~1 s
+        RL->>PG: SELECT * FROM outbox WHERE sent_at IS NULL<br/>ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED
+        RL->>R: videoQueue.add(…, {jobId: video-42})
+        RL->>PG: UPDATE outbox SET sent_at = now()
+        Note over RL,R: Redis down? leave the rows, try again next tick
+    end
 ```
 
 The trick: the request only writes to **one** system, Postgres, so it can use **one** transaction. Getting the message from Postgres to Redis becomes a separate, retryable background step. If the relay crashes after `add()` but before marking the row sent, it sends again next tick, so the relay is *at least once*, and the idempotent `jobId` turns the duplicate into a no-op. Every part of this flow can now fail and recover without a human.
@@ -673,9 +711,67 @@ const isFinalAttempt = (job: Job, err: unknown) =>
 | 1st | 0 | no | warn, rethrow → delayed 5 s |
 | 2nd | 1 | no | warn, rethrow → delayed 10 s |
 | 3rd | 2 | **yes** | mark ERROR, rethrow → failed |
-| any | – | (UnrecoverableError → final) | mark ERROR, rethrow → failed, no retries | Why not the worker's `failed` event, as the plan's reference code does? A `Worker` emits `failed` only for errors thrown by its own processor (checked in BullMQ's `worker.js`). A job that fails because it stalled too many times reaches neither place. Since neither covers everything, the processor keeps the decision next to its context, and the requeue script handles the rest.
+| any | – | (UnrecoverableError → final) | mark ERROR, rethrow → failed, no retries |
 
-`FAIL_RATE` (0 to 1) makes that share of attempts throw a transient error. The env schema refuses a non-zero value in production.
+Why not the worker's `failed` event, as the plan's reference code does? A `Worker` emits `failed` only for errors thrown by its own processor (checked in BullMQ's `worker.js`). A job that fails because it stalled too many times reaches neither place. Since neither covers everything, the processor keeps the decision next to its context, and the requeue script handles the rest.
+
+#### `FAIL_RATE`: failing on purpose
+
+Retries, backoff and the final ERROR are code paths that almost never run in a healthy dev setup. Code that never runs is code you can't trust. `FAIL_RATE` is a **fault-injection** switch: it makes the worker fail on purpose, so you can watch the failure handling work.
+
+```ts
+FAIL_RATE: z.coerce.number().min(0).max(1).default(0),
+
+.refine((value) => value.NODE_ENV !== 'production' || value.FAIL_RATE === 0, {
+  message: 'FAIL_RATE must be 0 in production.',
+  path: ['FAIL_RATE'],
+});
+```
+
+- **`min(0).max(1)`.** It's a probability. `1.5` or `-1` is a typo and fails at boot.
+- **`default(0)`.** It's off unless you ask for it. `.env.example` lists it as `FAIL_RATE=0` so you know it exists.
+- **The `.refine`.** A schema-wide rule: if `NODE_ENV=production` and `FAIL_RATE` isn't 0, the process refuses to start. A test switch left on by accident must never fail real users' videos. It checks the whole object, not one field, because the rule involves two variables.
+- **Only the worker reads it**, in `transcode` at step 3 (see the stub steps above).
+
+**What a run looks like.** Each attempt rolls the dice independently:
+
+```mermaid
+flowchart LR
+    A1["attempt 1"] -->|"fails: p = FAIL_RATE"| D1["delayed 5 s"]
+    A1 -->|"passes"| OK(["READY"])
+    D1 --> A2["attempt 2"]
+    A2 -->|"fails"| D2["delayed 10 s"]
+    A2 -->|"passes"| OK
+    D2 --> A3["attempt 3 (final)"]
+    A3 -->|"passes"| OK
+    A3 -->|"fails"| ERR(["ERROR + reason<br/>job → failed"])
+```
+
+| `FAIL_RATE` | an attempt fails | video ends READY on the 1st try | needs a retry but ends READY | ends ERROR (`FAIL_RATE³`) |
+|---|---|---|---|---|
+| 0 | never | 100% | 0% | 0% |
+| 0.2 | 20% | 80% | 19.2% | 0.8% |
+| 0.5 | 50% | 50% | 37.5% | 12.5% |
+| 0.9 | 90% | 10% | 17.1% | 72.9% |
+| 1 | always | 0% | 0% | 100% |
+
+That table is the whole argument for retries. With a 20% transient failure rate, a single attempt loses 1 video in 5, and three attempts lose fewer than 1 in 100.
+
+How to use it:
+
+```powershell
+$env:FAIL_RATE=1; npm run dev:worker      # every attempt fails: watch backoff, then ERROR
+$env:FAIL_RATE=0.5; npm run dev:worker    # a mix: some first try, some retried, ~1 in 8 ERROR
+```
+
+What to look at:
+- **Bull Board**: the job moves `active → delayed → waiting → active` with growing gaps, and the attempt count rises. On the last failure it lands in `failed`, with the error and a stack trace per attempt.
+- **Worker logs**: `attempt failed, will retry` (warn) with `attempt: 1`, `2`, then `processing failed for good` (error) with `markedError: true`.
+- **Postgres**: `SELECT status, error_message FROM videos WHERE id = '…'` shows `ERROR` and `Simulated transient failure (FAIL_RATE)`.
+
+Measured in Sprint 5 (the table below): `FAIL_RATE=1` gave 3 attempts then ERROR. `FAIL_RATE=0.5` over 8 uploads gave 6 READY first time, 1 READY on attempt 3 and 1 ERROR, close to the expected 12.5%.
+
+**In Sprint 6**, the stub loop goes away, but the switch stays. It will fire *before* the expensive part (right after the download), so a simulated failure doesn't waste a full FFmpeg encode. It will still throw a plain `Error`, because the point is to exercise retries, not the bad-input path.
 
 ### `WORKER_CONCURRENCY`
 
@@ -690,14 +786,19 @@ const videoWorker = new Worker<TranscodeJob>(VIDEO_QUEUE, processVideo, {
 
 It is BullMQ's `concurrency` option (see [Concurrency vs parallelism](#concurrency-vs-parallelism)) read from the environment: **how many jobs this one worker process runs at the same time.** It doesn't create threads or processes. One Node thread keeps N `processVideo` calls in flight, and they take turns whenever one of them `await`s.
 
-```
- WORKER_CONCURRENCY=1                         WORKER_CONCURRENCY=3
- ┌ worker process (1 thread) ┐                ┌ worker process (1 thread) ┐
- │ slot 1: job A ███████     │                │ slot 1: job A ███████     │
- │         job B        ████ │                │ slot 2: job B ███████     │
- │         job C           … │                │ slot 3: job C ███████     │
- └───────────────────────────┘                └───────────────────────────┘
-   Redis: B, C wait in `wait`                   3 locks held, 3 renewal timers
+```mermaid
+gantt
+    title 3 stub jobs of 2.5 s each, one worker process
+    dateFormat x
+    axisFormat %S s
+    section concurrency 1 (B and C wait in Redis)
+    slot 1 - job A :0, 2500
+    slot 1 - job B :2500, 5000
+    slot 1 - job C :5000, 7500
+    section concurrency 3 (3 locks, 3 renewal timers)
+    slot 1 - job A :0, 2500
+    slot 2 - job B :0, 2500
+    slot 3 - job C :0, 2500
 ```
 
 What each slot means in practice:
@@ -739,15 +840,15 @@ The API process ignores this variable; only `worker.ts` reads it.
 
 **It is not round-robin, and nobody hands out jobs.** There's no dispatcher that pushes job 1 to worker A and job 2 to worker B. Each worker **pulls**: whenever one of its slots is free, it asks Redis for the next job. These are called *competing consumers*.
 
-```
-                        Redis: bull:video-processing
-              wait (list, oldest on the right)              active
-   add() ─► LPUSH ─► [ j7 | j6 | j5 | j4 ] ── RPOPLPUSH ──► [ j1 j2 j3 ]
-                                              (atomic Lua: one job → one caller)
-                        ▲            ▲             ▲
-          free slot? ───┘            │             └─── free slot?
-   worker A (conc 1)         worker B (conc 2)          worker C (conc 1)
-   busy: j1                  busy: j2, j3               idle → gets j4 next
+```mermaid
+flowchart LR
+    ADD["add()"] -->|"LPUSH"| WAIT
+    subgraph REDIS["Redis: bull:video-processing"]
+        WAIT[["wait (oldest on the right)<br/>j7 · j6 · j5 · j4"]] -->|"RPOPLPUSH<br/>atomic Lua: one job → one caller"| ACT[["active<br/>j1 · j2 · j3"]]
+    end
+    WA["worker A (conc 1)<br/>busy: j1"] -.->|"no free slot, doesn't ask"| WAIT
+    WB["worker B (conc 2)<br/>busy: j2, j3"] -.->|"no free slot, doesn't ask"| WAIT
+    WC["worker C (conc 1)<br/>idle"] ==>|"free slot → gets j4 next"| WAIT
 ```
 
 How a fetch works (BullMQ 6, from `worker.js` and `moveToActive-11.lua`):
@@ -778,12 +879,14 @@ What scaling out doesn't fix:
 
 ### Graceful shutdown
 
-```
-SIGINT / SIGTERM → worker.close()              stop taking jobs, wait for active ones
-                 → close queue + connections, Postgres, Redis
-                 → exit 0
-second signal, or 30 s → exit 1 now. The unfinished job keeps its lock until it expires,
-                         then any worker's stalled check moves it back to waiting.
+```mermaid
+flowchart TD
+    SIG["SIGINT / SIGTERM"] --> CLOSE["worker.close()<br/>stop taking jobs, wait for active ones"]
+    CLOSE --> CONN["close queue + connections, Postgres, Redis"]
+    CONN --> EXIT0(["exit 0"])
+    SIG2["second signal, or 30 s passed"] --> EXIT1(["exit 1 now"])
+    EXIT1 --> LOCK["the unfinished job keeps its lock until it expires"]
+    LOCK --> STALL["any worker's stalled check moves it back to waiting"]
 ```
 
 Docker's default stop grace period is 10 s. The worker container (Sprint 6) needs a `stop_grace_period` at least as long as the shutdown timeout, or every deploy kills jobs mid-way.
@@ -845,8 +948,9 @@ npm run dev:worker                   # terminal 2: worker
 
 The Sprint 6 pipeline has several stages:
 
-```
-download raw → ffprobe → transcode 1080/720/480 → thumbnail → upload HLS + thumbnail → READY
+```mermaid
+flowchart LR
+    D["download raw"] --> P["ffprobe"] --> T["transcode 1080/720/480"] --> TH["thumbnail"] --> U["upload HLS + thumbnail"] --> R(["READY"])
 ```
 
 BullMQ gives three shapes for this.
@@ -989,13 +1093,17 @@ This combines the step-job idea (`updateData`) with flows.
 
 The tempting design is one job per stage:
 
-```
-flow parent: finalize (mark READY)
- ├── child: transcode   (download → ffmpeg → upload HLS)
- └── child: thumbnail   (download → ffmpeg 1 frame → upload jpg)
-
-or as a chain (deepest runs first):
- finalize ◀── upload ◀── transcode ◀── probe ◀── download
+```mermaid
+flowchart TB
+    subgraph TREE["as a flow (parent waits for its children)"]
+        direction BT
+        TR["child: transcode<br/>download → ffmpeg → upload HLS"] --> FP["flow parent: finalize<br/>(mark READY)"]
+        TN["child: thumbnail<br/>download → ffmpeg 1 frame → upload jpg"] --> FP
+    end
+    subgraph CHAIN["or as a chain (deepest runs first)"]
+        direction LR
+        DL["download"] --> PR["probe"] --> TC["transcode"] --> UP["upload"] --> FN["finalize"]
+    end
 ```
 
 It looks cleaner on a diagram. Three things make it worse for us, though.

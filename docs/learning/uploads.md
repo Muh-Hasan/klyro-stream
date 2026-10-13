@@ -29,31 +29,39 @@ RustFS speaks the **S3 API**, the same protocol as AWS S3, so the AWS SDK works 
 
 ## The whole flow
 
-```
- client (CLI / browser)                 API                          RustFS                 Postgres
- │                                       │                              │                       │
- │ 1 POST /clubs/:clubId/videos/uploads  │                              │                       │
- │   {title, contentType, sizeBytes} ───►│ validate, role check         │                       │
- │                                       │ CreateMultipartUpload ──────►│ opens a session       │
- │                                       │◄──────────────── UploadId ───│                       │
- │                                       │ insert video UPLOADING (+uploadId) ─────────────────►│
- │◄── {videoId, partSize, partCount} ────│                              │                       │
- │                                       │                              │                       │
- │ 2 POST /videos/:id/upload/parts       │                              │                       │
- │   {partNumbers:[1,2,3,4]} ───────────►│ sign 4 URLs (no network)     │                       │
- │◄── [{partNumber, url}, …] ────────────│                              │                       │
- │                                                                      │                       │
- │ 3 PUT url₁ (bytes 0…8 MiB) ─────────────────────────────────────────►│ store part 1          │
- │◄───────────────────────────────────────────────── ETag "129f…" ──────│                       │
- │   … parts 2-4 in parallel, then ask for the next batch …             │                       │
- │                                                                      │                       │
- │ 4 (after a crash) GET /videos/:id/upload/parts ─►│ ListParts ───────►│                       │
- │◄── {uploaded:[…], missing:[…]} ─────────────────│◄── parts + ETags ──│                       │
- │                                                                      │                       │
- │ 5 POST /videos/:id/upload/complete    │                              │                       │
- │   {parts:[{partNumber, etag}, …]} ───►│ lock row; Complete… ────────►│ stitch → one object   │
- │                                       │ transition → PROCESSING ────────────────────────────►│
- │◄── {videoId, status: PROCESSING} ─────│                              │                       │
+```mermaid
+sequenceDiagram
+    participant CL as Client (CLI / browser)
+    participant API
+    participant S3 as RustFS
+    participant PG as Postgres
+    Note over CL,PG: 1 · initiate
+    CL->>API: POST /clubs/:clubId/videos/uploads<br/>{title, contentType, sizeBytes}
+    API->>API: validate, role check
+    API->>S3: CreateMultipartUpload (opens a session)
+    S3-->>API: UploadId
+    API->>PG: insert video UPLOADING (+uploadId)
+    API-->>CL: {videoId, partSize, partCount}
+    Note over CL,PG: 2 · presign
+    CL->>API: POST /videos/:id/upload/parts<br/>{partNumbers: [1,2,3,4]}
+    API->>API: sign 4 URLs (no network)
+    API-->>CL: [{partNumber, url}, …]
+    Note over CL,PG: 3 · bytes go straight to storage
+    CL->>S3: PUT url₁ (bytes 0…8 MiB)
+    S3-->>CL: ETag "129f…" (part 1 stored)
+    Note over CL,S3: parts 2–4 in parallel, then ask for the next batch
+    Note over CL,PG: 4 · after a crash
+    CL->>API: GET /videos/:id/upload/parts
+    API->>S3: ListParts
+    S3-->>API: parts + ETags
+    API-->>CL: {uploaded: […], missing: […]}
+    Note over CL,PG: 5 · complete
+    CL->>API: POST /videos/:id/upload/complete<br/>{parts: [{partNumber, etag}, …]}
+    API->>PG: lock row (FOR UPDATE)
+    API->>S3: CompleteMultipartUpload
+    S3-->>API: parts stitched into one object
+    API->>PG: transition → PROCESSING
+    API-->>CL: {videoId, status: PROCESSING}
 ```
 
 The API only ever handles small JSON. The video bytes go client → RustFS.
@@ -221,17 +229,17 @@ The resuming client:
 
 Resume only works because **the client still has the file**. The API never knows where it is, and never needs to.
 
-```
- YOUR LAPTOP                                   SERVER SIDE
- ┌──────────────────────────────────┐          ┌───────────────────────────────────────┐
- │ D:\videos\final.mp4  (228 MB)    │          │ API + Postgres                         │
- │   only the client knows this path│          │   videos row: id, size_bytes=239266402,│
- │                                  │          │   upload_id, raw_path (storage key)    │
- │ backend\.upload-state\d410….json │          │   (no laptop path, no bytes)           │
- │   {"videoId": "31852180…"}       │          │                                        │
- │   the bookmark: which upload     │          │ RustFS session (upload_id)             │
- │   belongs to this file           │          │   parts 1–8 stored, with ETags         │
- └──────────────────────────────────┘          └───────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph LAPTOP["Your laptop"]
+        F["D:\videos\final.mp4 (228 MB)<br/>only the client knows this path"]
+        ST["backend\.upload-state\d410….json<br/>{videoId: 31852180…}<br/>the bookmark: which upload belongs to this file"]
+    end
+    subgraph SERVER["Server side"]
+        PG["API + Postgres<br/>videos row: id, size_bytes=239266402,<br/>upload_id, raw_path (storage key)<br/>no laptop path, no bytes"]
+        S3["RustFS session (upload_id)<br/>parts 1–8 stored, with ETags"]
+    end
+    LAPTOP -->|"only videoId and part numbers cross this line"| SERVER
 ```
 
 | Piece of knowledge | Lives on | Who uses it |
@@ -249,15 +257,21 @@ part 9  →  bytes [8 × 8 MiB, 9 × 8 MiB)  →  fs.read(file, start = 67108864
 
 **What a resume looks like, from the client's side:**
 
-```
-1. user runs:  npm run upload -- D:\videos\final.mp4 --club …
-2. CLI fingerprints the file (path + size + mtime) → d410…
-3. CLI finds .upload-state\d410….json → videoId 31852180…        (laptop memory)
-4. CLI → API:  GET /videos/31852180…/upload/parts
-5. API → RustFS: ListParts → parts 1–8                            (storage memory)
-6. API → CLI:  { missing: [9 … 29], uploaded: [receipts 1–8] }
-7. CLI reads bytes for parts 9–29 from D:\videos\final.mp4 and PUTs them to RustFS
-8. CLI → API: complete with receipts 1–29
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant CLI
+    participant API
+    participant S3 as RustFS
+    U->>CLI: npm run upload -- D:\videos\final.mp4 --club …
+    CLI->>CLI: fingerprint the file (path + size + mtime) → d410…
+    CLI->>CLI: .upload-state\d410….json → videoId 31852180… (laptop memory)
+    CLI->>API: GET /videos/31852180…/upload/parts
+    API->>S3: ListParts
+    S3-->>API: parts 1–8 (storage memory)
+    API-->>CLI: {missing: [9 … 29], uploaded: [receipts 1–8]}
+    CLI->>S3: read bytes for parts 9–29 from the file and PUT them
+    CLI->>API: complete with receipts 1–29
 ```
 
 **What breaks resume, and what happens:**
@@ -354,13 +368,15 @@ Measured: a 1 GB file killed at 16% resumed from part 21/128, and the stored obj
 
 ## The video state machine
 
-```
-            complete ok              worker finishes (Sprint 6)
-UPLOADING ─────────────► PROCESSING ─────────────► READY
-    │                        │
-    │ abort / size mismatch  │ processing fails
-    ▼                        ▼
-  ERROR ◄────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> UPLOADING
+    UPLOADING --> PROCESSING: complete ok
+    PROCESSING --> READY: worker finishes (Sprint 6)
+    UPLOADING --> ERROR: abort / size mismatch
+    PROCESSING --> ERROR: processing fails
+    READY --> [*]
+    ERROR --> [*]
 ```
 
 `TRANSITIONS` in `repositories/video.repository.ts` is the single source of truth. `transition(id, from, to, changes)` throws `IllegalTransitionError` for an arrow that isn't allowed (a bug → 500) and returns `undefined` when the row has already moved (a normal race → 409). `READY` and `ERROR` are terminal.

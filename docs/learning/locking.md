@@ -6,21 +6,27 @@ How KlyroStream stays correct when two requests touch the same data at the same 
 
 Most bugs in this area have the same shape:
 
-```
-1. read something        (is there another admin? is the invite still pending?)
-2. decide                (yes → allowed)
-3. write                 (demote, accept)
+```mermaid
+flowchart LR
+    R["1 · read something<br/>is there another admin?<br/>is the invite still pending?"] --> D["2 · decide<br/>yes → allowed"] --> W["3 · write<br/>demote, accept"]
 ```
 
 If two requests run steps 1–3 interleaved, both read the *old* state, both decide "allowed", and both write. Each request on its own was correct; together they break a rule.
 
 Example: a club has two admins, A and B. A demotes B while B demotes A.
 
-```
-request 1 (A demotes B)        request 2 (B demotes A)
-count admins → 2               count admins → 2
-2 > 1, allowed                 2 > 1, allowed
-UPDATE B → viewer              UPDATE A → viewer
+```mermaid
+sequenceDiagram
+    participant R1 as Request 1 (A demotes B)
+    participant DB as Postgres
+    participant R2 as Request 2 (B demotes A)
+    R1->>DB: count admins
+    R2->>DB: count admins
+    DB-->>R1: 2, so 2 > 1 → allowed
+    DB-->>R2: 2, so 2 > 1 → allowed
+    R1->>DB: UPDATE B → viewer
+    R2->>DB: UPDATE A → viewer
+    Note over DB: zero admins ✖
 ```
 
 The club now has zero admins, and nobody can ever manage it again. A normal transaction does not prevent this (see isolation below).
@@ -93,18 +99,22 @@ COMMIT;
 
 The decision ("am I the last admin?") depends on the **set** of admins, so the set is what must stay stable. Replaying the race from above:
 
-```
-request 1 (A demotes B)                 request 2 (B demotes A)
-BEGIN                                   BEGIN
-lock admin rows {A, B}  ✔
-                                        lock admin rows {A, B}  … waits for request 1
-target B is admin, 2 admins → allowed
-UPDATE B → viewer
-COMMIT  (locks released)
-                                        gets the locks; re-checks WHERE role='admin'
-                                        B no longer matches → admins = {A}
-                                        target A is admin, 1 admin → LAST_ADMIN (409)
-                                        ROLLBACK
+```mermaid
+sequenceDiagram
+    participant R1 as Request 1 (A demotes B)
+    participant DB as Postgres
+    participant R2 as Request 2 (B demotes A)
+    R1->>DB: BEGIN
+    R2->>DB: BEGIN
+    R1->>DB: lock admin rows {A, B} ✔
+    R2->>DB: lock admin rows {A, B}
+    Note over DB,R2: waits for request 1
+    R1->>R1: target B is admin, 2 admins → allowed
+    R1->>DB: UPDATE B → viewer
+    R1->>DB: COMMIT (locks released)
+    DB-->>R2: gets the locks, re-checks WHERE role='admin'<br/>B no longer matches → admins = {A}
+    R2->>R2: target A is admin, 1 admin → LAST_ADMIN (409)
+    R2->>DB: ROLLBACK
 ```
 
 The second request is forced to wait and then sees the truth. Exactly one demotion wins.
@@ -121,12 +131,17 @@ If the target is a viewer or club_owner, they aren't in the admin set, so the fi
 
 Under READ COMMITTED a row that *becomes* an admin after our statement started isn't added to our result. So:
 
-```
-request 1 (promote C to admin)       request 2 (sole admin A demotes self)
-lock admins {A}, lock C
-UPDATE C → admin, COMMIT
-                                     was waiting on A; gets it; result is still {A}
-                                     → LAST_ADMIN (409)
+```mermaid
+sequenceDiagram
+    participant R1 as Request 1 (promote C to admin)
+    participant DB as Postgres
+    participant R2 as Request 2 (sole admin A demotes self)
+    R1->>DB: lock admins {A}, lock C
+    R2->>DB: lock admins
+    Note over DB,R2: waits on A
+    R1->>DB: UPDATE C → admin, COMMIT
+    DB-->>R2: gets A, but its result is still {A}
+    R2->>R2: LAST_ADMIN (409)
 ```
 
 Request 2 is rejected even though C is now an admin. That errs on the safe side (no rule is broken), and retrying succeeds. Avoiding it would need `SERIALIZABLE` isolation plus retry logic, which isn't worth it here.
@@ -166,13 +181,18 @@ RETURNING club_id, role;
 
 The check (`status = 'pending'`) and the write happen in **one statement**. If two people click "Accept" and "Decline" at the same moment:
 
-```
-request 1 (accept)                         request 2 (reject)
-UPDATE … WHERE status='pending' → 1 row
-                                           UPDATE … same row → waits on row lock
-COMMIT
-                                           re-checks WHERE: status is 'accepted'
-                                           → 0 rows → reject returns false → 400
+```mermaid
+sequenceDiagram
+    participant R1 as Request 1 (accept)
+    participant DB as Postgres
+    participant R2 as Request 2 (reject)
+    R1->>DB: UPDATE … WHERE status='pending'
+    DB-->>R1: 1 row
+    R2->>DB: UPDATE … same row
+    Note over DB,R2: waits on the row lock
+    R1->>DB: COMMIT
+    DB-->>R2: re-checks WHERE: status is 'accepted' → 0 rows
+    R2->>R2: reject returns false → 400
 ```
 
 No explicit lock, no read beforehand. "How many rows did I change?" *is* the answer.
@@ -261,9 +281,15 @@ export const consume = async (jti: string, exp: number) =>
 
 `SET key 1 EX ttl NX` writes only if the key does **not** exist and returns `OK`, otherwise `null`. Each refresh token has a unique `jti`. Two requests using the same refresh token:
 
-```
-request 1: SET blacklist:token:abc NX → OK   → new tokens issued
-request 2: SET blacklist:token:abc NX → null → TOKEN_REUSED
+```mermaid
+sequenceDiagram
+    participant R1 as Request 1
+    participant RD as Redis
+    participant R2 as Request 2
+    R1->>RD: SET blacklist:token:abc 1 NX
+    RD-->>R1: OK → new tokens issued
+    R2->>RD: SET blacklist:token:abc 1 NX
+    RD-->>R2: null → TOKEN_REUSED
 ```
 
 A reused token suggests it was stolen, so the losing request also bumps `token_version`, which invalidates every refresh token for that user (`SESSION_REVOKED` on their next refresh). The TTL equals the token's remaining lifetime, so keys clean themselves up.
@@ -302,11 +328,18 @@ UPDATE videos SET status = 'PROCESSING' WHERE id = $1 AND status = 'UPLOADING' R
 
 That protects the row, but complete and abort each pair the transition with an **S3 call** (`CompleteMultipartUpload` / `AbortMultipartUpload`), and the conditional write can't protect that pair. Without more, this can happen:
 
-```
-complete: S3 stitches the object ─────────────┐
-abort:                     wins the row → ERROR│
-complete:                       transition → 0 rows
-result:   an object in the bucket for a video marked ERROR
+```mermaid
+sequenceDiagram
+    participant C as complete request
+    participant S3 as RustFS
+    participant PG as Postgres
+    participant A as abort request
+    C->>S3: CompleteMultipartUpload
+    S3-->>C: object stitched
+    A->>PG: UPDATE … WHERE status='UPLOADING' → ERROR (wins the row)
+    C->>PG: transition → PROCESSING
+    PG-->>C: 0 rows
+    Note over S3,PG: result: an object in the bucket for a video marked ERROR ✖
 ```
 
 So both run inside `videoRepo.withUploadLock(id, fn)`:

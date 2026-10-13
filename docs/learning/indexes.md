@@ -8,12 +8,15 @@ A table is stored as an unordered pile of rows (the *heap*). To answer `WHERE em
 
 An index is a separate, **sorted** structure that maps column values to row locations. The default type is a **B-tree**, a balanced tree a few levels deep. Finding one value means walking from the root to a leaf, which is a handful of page reads whether the table has 100 rows or 100 million.
 
-```
-            [ m ]                       root
-          /       \
-     [ c | g ]   [ r | w ]              branches
-     /   |   \    ...
- [a b] [d e f] [h i ...]                leaves → point at rows in the heap
+```mermaid
+flowchart TD
+    ROOT["root: m"] --> B1["branch: c | g"]
+    ROOT --> B2["branch: r | w"]
+    B1 --> L1["leaf: a b"]
+    B1 --> L2["leaf: d e f"]
+    B1 --> L3["leaf: h i …"]
+    B2 --> L4["leaf: …"]
+    L1 & L2 & L3 & L4 -.->|"point at rows"| HEAP[("heap: the table's rows")]
 ```
 
 Besides `=`, a B-tree also handles `<`, `>`, `BETWEEN`, `ORDER BY`, `IN`, and `LIKE 'prefix%'`. Postgres has other index types (GIN for arrays/JSON/full-text, GiST for geometry/ranges, BRIN for huge append-only tables, hash), but every index in this project is a B-tree.

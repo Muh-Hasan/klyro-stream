@@ -17,14 +17,22 @@ Contents:
 
 Postgres speaks to each client over a **connection**, and each connection is served by its own backend process on the server. A connection runs one statement at a time. Opening one costs a TCP handshake, auth and a fork on the server, so apps keep a **pool** of open connections and lend them out.
 
-```
- API process (Node, 1 thread)                           Postgres
- ┌────────────────────────────────────┐                ┌──────────────────┐
- │ request A ─┐                       │                │ backend pid 101  │
- │ request B ─┼─► pool (max 10) ──────┼── conn 1 ─────►│ backend pid 102  │
- │ request C ─┘   [1][2][3]…[10]      │── conn 2 ─────►│ …                │
- └────────────────────────────────────┘                └──────────────────┘
- worker process: its own pool (max 10), its own connections
+```mermaid
+flowchart LR
+    subgraph APIP["API process (Node, 1 thread)"]
+        RA["request A"] & RB["request B"] & RC["request C"] --> POOL[["pool: max 10 connections"]]
+    end
+    subgraph WP["Worker process"]
+        WPOOL[["its own pool: max 10"]]
+    end
+    subgraph PGS["Postgres"]
+        P1["backend pid 101"]
+        P2["backend pid 102"]
+        P3["…"]
+    end
+    POOL -->|"conn 1"| P1
+    POOL -->|"conn 2"| P2
+    WPOOL -->|"its own connections"| P3
 ```
 
 In KlyroStream (`backend/src/lib/db/client.ts`):
@@ -45,13 +53,25 @@ A transaction groups statements so they behave as one unit. The four guarantees 
 | **I**solation | Concurrent transactions don't see each other's half-done work | Nobody sees a club with no members, even for a moment |
 | **D**urability | Once `COMMIT` returns, it survives a crash | The write-ahead log (WAL) is flushed to disk before `COMMIT` returns |
 
-```
- BEGIN
-   INSERT clubs           ┐
-   INSERT club_members    ├─ invisible to everyone else until COMMIT
-   INSERT download_quotas ┘
- COMMIT    ──► all three visible at once
- (or ROLLBACK / an error ──► none of them ever existed)
+```mermaid
+sequenceDiagram
+    participant T as Transaction
+    participant PG as Postgres
+    participant O as Everyone else
+    T->>PG: BEGIN
+    rect rgba(0, 150, 255, 0.12)
+    T->>PG: INSERT clubs
+    T->>PG: INSERT club_members
+    T->>PG: INSERT download_quotas
+    Note over PG,O: invisible to everyone else until COMMIT
+    end
+    alt COMMIT
+        T->>PG: COMMIT
+        PG-->>O: all three visible at once
+    else ROLLBACK, or an error
+        T->>PG: ROLLBACK
+        Note over PG,O: none of them ever existed
+    end
 ```
 
 Important: **atomicity is about your own writes, not about other people's.** A transaction doesn't freeze the database, and other transactions keep committing around you. Protection from other writers comes from isolation and locks, below.
@@ -68,15 +88,20 @@ Postgres has three useful levels. They differ in what a statement is allowed to 
 
 Picture READ COMMITTED with two transactions:
 
-```
- T1                                   T2
- BEGIN
- SELECT count(*) admins → 2
-                                      BEGIN
-                                      UPDATE … SET role='viewer' WHERE user=B
-                                      COMMIT
- SELECT count(*) admins → 1           ◄── new statement, new snapshot: sees T2's commit
- COMMIT
+```mermaid
+sequenceDiagram
+    participant T1
+    participant PG as Postgres
+    participant T2
+    T1->>PG: BEGIN
+    T1->>PG: SELECT count(*) admins
+    PG-->>T1: 2
+    T2->>PG: BEGIN
+    T2->>PG: UPDATE … SET role='viewer' WHERE user=B
+    T2->>PG: COMMIT
+    T1->>PG: SELECT count(*) admins
+    PG-->>T1: 1 (new statement, new snapshot: sees T2's commit)
+    T1->>PG: COMMIT
 ```
 
 T1's two reads disagree. That's allowed under READ COMMITTED, and it's why "read, decide, write" is unsafe even inside a transaction ([locking.md: check-then-act](locking.md#the-problem-check-then-act)). We fix it with locks or conditional writes, not by raising the isolation level. Those tools are explicit, need no retry loop, and only cost something where they're used.
@@ -85,10 +110,11 @@ T1's two reads disagree. That's allowed under READ COMMITTED, and it's why "read
 
 Postgres doesn't overwrite a row in place. An `UPDATE` writes a **new version** of the row and marks the old one as dead from that point on. Each statement reads the versions that were committed when it started (its *snapshot*).
 
-```
- videos row 42:
-   v1  status=UPLOADING   (visible to snapshots taken before T commits)
-   v2  status=PROCESSING  (written by T; visible to snapshots taken after T commits)
+```mermaid
+flowchart LR
+    V1["row 42 · v1<br/>status = UPLOADING"] -->|"T's UPDATE writes a new version"| V2["row 42 · v2<br/>status = PROCESSING"]
+    S1["snapshots taken before T commits"] -.->|"see"| V1
+    S2["snapshots taken after T commits"] -.->|"see"| V2
 ```
 
 This is **M**ulti-**V**ersion **C**oncurrency **C**ontrol. Consequences:
@@ -109,11 +135,18 @@ Row locks are taken automatically by `UPDATE` and `DELETE`, and on purpose by `S
 
 **The rule that makes everything work:** when a blocked `UPDATE` or `FOR UPDATE` finally gets the row, Postgres **re-checks its `WHERE` against the newest committed version** (this is called EvalPlanQual). If the row no longer matches, it's skipped, and you get 0 rows.
 
-```
- T1: UPDATE videos SET status='PROCESSING' WHERE id=42 AND status='UPLOADING'   ── locks row 42
- T2: UPDATE videos SET status='ERROR'      WHERE id=42 AND status='UPLOADING'   ── waits…
- T1: COMMIT
- T2: wakes, re-checks "status='UPLOADING'" on the new version → false → 0 rows
+```mermaid
+sequenceDiagram
+    participant T1
+    participant PG as Postgres (row 42)
+    participant T2
+    T1->>PG: UPDATE videos SET status='PROCESSING'<br/>WHERE id=42 AND status='UPLOADING'
+    Note over PG: row 42 locked by T1
+    T2->>PG: UPDATE videos SET status='ERROR'<br/>WHERE id=42 AND status='UPLOADING'
+    Note over PG,T2: waits…
+    T1->>PG: COMMIT
+    PG-->>T2: wakes, re-checks status='UPLOADING' on the new version → false
+    PG-->>T2: 0 rows: T2 lost, nothing was overwritten
 ```
 
 T2 didn't overwrite T1. It noticed it lost. Every conditional write and every `FOR UPDATE` in this codebase relies on this.
@@ -122,10 +155,12 @@ T2 didn't overwrite T1. It noticed it lost. Every conditional write and every `F
 
 Two transactions each hold a lock the other wants:
 
-```
- T1: lock row A ─────────────► wants row B ⏳
- T2: lock row B ─────────────► wants row A ⏳
-                 (neither can ever proceed)
+```mermaid
+flowchart LR
+    T1["T1"] -->|"holds"| A[("row A")]
+    T2["T2"] -->|"holds"| B[("row B")]
+    T1 -.->|"wants ⏳"| B
+    T2 -.->|"wants ⏳"| A
 ```
 
 Postgres checks for cycles after `deadlock_timeout` (1 s by default), kills one transaction with `ERROR: deadlock detected`, and the other one continues. The fix is to **always lock rows in the same order**. That's what `ORDER BY user_id` does in `lockMember`.
@@ -136,11 +171,9 @@ Postgres checks for cycles after `deadlock_timeout` (1 s by default), kills one 
 
 ## Layers
 
-```
- controller ──► service ──► repository ──► db / tx ──► Postgres
-   HTTP          rules,       SQL, and the      the pool or one
-   shape         ordering,    transaction       borrowed connection
-                 S3, queue    boundaries
+```mermaid
+flowchart LR
+    C["controller<br/>HTTP shape"] --> S["service<br/>rules, ordering, S3, queue"] --> R["repository<br/>SQL and transaction boundaries"] --> D["db / tx<br/>the pool, or one borrowed connection"] --> PG[("Postgres")]
 ```
 
 - **Only repositories import `db`** (`lib/db/client.ts`). Services never write SQL and never call `db.transaction` directly.
@@ -155,9 +188,10 @@ export type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
 
 This reads as: "the type of the first argument of the callback you pass to `db.transaction`". It is the transaction handle.
 
-```
- db.update(...)          → any free pool connection, auto-commits on its own
- tx.update(...)          → the transaction's connection, part of its BEGIN…COMMIT
+```mermaid
+flowchart LR
+    DB["db.update(...)"] -->|"any free pool connection,<br/>auto-commits on its own"| C3[("conn 3")]
+    TX["tx.update(...)"] -->|"the transaction's connection,<br/>part of its BEGIN…COMMIT"| C7[("conn 7, held by the tx")]
 ```
 
 If a helper inside a transaction used `db` by mistake, its statement would run **on another connection, outside the transaction**. It wouldn't see the uncommitted rows, it would commit on its own even if the outer transaction rolled back, and it could **wait forever on a lock the outer transaction holds** (a self-deadlock that Postgres can't detect, because it spans two connections). That's why every helper that runs inside a transaction takes `tx` as a parameter:
@@ -192,22 +226,23 @@ There's no `commit()` to forget. The shape of the callback *is* the boundary. Th
 
 ## The map
 
+```mermaid
+flowchart TB
+    subgraph PG["Postgres"]
+        USERS["users<br/>U: unique(email), unique(provider, provider_id)<br/>A: token_version = token_version + 1"]
+        CLUBS["clubs"]
+        MEM["club_members<br/>P: FOR UPDATE (admins + target)"]
+        QUO["download_quotas"]
+        INV["club_invitations<br/>C: claim = UPDATE … WHERE status=pending<br/>U: unique(token_hash), unique(club_id, email) WHERE pending"]
+        VID["videos<br/>P: FOR UPDATE WHERE status=UPLOADING (withUploadLock)<br/>C: transition = UPDATE … WHERE status=from"]
+        CLUBS --> MEM
+        CLUBS --> QUO
+        CLUBS --> INV
+        CLUBS --> VID
+    end
 ```
- ┌──────────────────────────── Postgres ──────────────────────────────────┐
- │                                                                        │
- │  users             unique(email), unique(provider, provider_id)  ◄─ U  │
- │    └ token_version = token_version + 1                           ◄─ A  │
- │                                                                        │
- │  clubs ─┬─ club_members ◄──────── FOR UPDATE (admins + target)   ◄─ P  │
- │         ├─ download_quotas                                             │
- │         └─ club_invitations  claim: UPDATE … WHERE status=pending ◄─ C  │
- │              unique(token_hash), unique(club_id,email) WHERE pending◄─U│
- │                                                                        │
- │  videos  ◄──── FOR UPDATE WHERE status=UPLOADING (withUploadLock) ◄─ P │
- │          ◄──── transition: UPDATE … WHERE status=<from>           ◄─ C │
- └────────────────────────────────────────────────────────────────────────┘
-   P = pessimistic lock   C = conditional write   U = unique index   A = atomic expression
-```
+
+**P** = pessimistic lock, **C** = conditional write, **U** = unique index, **A** = atomic expression.
 
 | # | Operation | File | Transaction? | Lock / guard | Why |
 |---|---|---|---|---|---|
@@ -238,29 +273,40 @@ export const createWithOwner = (name: string, ownerId: string): Promise<Club> =>
   });
 ```
 
-```
- BEGIN
- INSERT clubs            → club.id
- INSERT club_members     (owner as admin)
- INSERT download_quotas
- COMMIT
+```mermaid
+sequenceDiagram
+    participant R as createWithOwner
+    participant PG as Postgres
+    R->>PG: BEGIN
+    R->>PG: INSERT clubs
+    PG-->>R: club.id
+    R->>PG: INSERT club_members (owner as admin)
+    R->>PG: INSERT download_quotas
+    R->>PG: COMMIT
 ```
 
 **Why a transaction:** without it, a crash or an FK error after the first insert would leave a club nobody can administer. **Why no lock:** the rows are brand new, so nobody else can see them until `COMMIT`. There's nothing to race on.
 
 ## 2. Change a member's role, or remove them
 
-```
- T1 (A demotes B)                              T2 (B demotes A)
- BEGIN                                          BEGIN
- SELECT admins ORDER BY user_id FOR UPDATE      SELECT admins ORDER BY user_id FOR UPDATE
-   → locks A, B                                   ⏳ waits for T1 (same rows, same order)
- SELECT target B FOR UPDATE
- 2 admins → allowed
- UPDATE B → viewer
- COMMIT ─────────────────────────────────────►  wakes, re-reads admins → only A
-                                                  1 admin and A is it → 409 LAST_ADMIN
-                                                ROLLBACK
+```mermaid
+sequenceDiagram
+    participant T1 as T1 (A demotes B)
+    participant PG as Postgres
+    participant T2 as T2 (B demotes A)
+    T1->>PG: BEGIN
+    T2->>PG: BEGIN
+    T1->>PG: SELECT admins ORDER BY user_id FOR UPDATE
+    Note over PG: locks A, B
+    T2->>PG: SELECT admins ORDER BY user_id FOR UPDATE
+    Note over PG,T2: ⏳ waits for T1 (same rows, same order)
+    T1->>PG: SELECT target B FOR UPDATE
+    T1->>T1: 2 admins → allowed
+    T1->>PG: UPDATE B → viewer
+    T1->>PG: COMMIT
+    PG-->>T2: wakes, re-reads admins → only A
+    T2->>T2: 1 admin and A is it → 409 LAST_ADMIN
+    T2->>PG: ROLLBACK
 ```
 
 **Why `FOR UPDATE` and not a conditional write:** the rule ("at least one admin") is about a *set* of rows, so no single row's `WHERE` can express it. Locking every admin row makes the count stable until commit. **Why `ORDER BY user_id`:** both transactions take the locks in the same order, so they queue instead of deadlocking. Full walkthrough: [locking.md §1](locking.md#1-pessimistic-lock-the-last-admin-rule).
@@ -281,21 +327,25 @@ export const withUploadLock = <T>(id: string, fn: (video: Video, tx: Tx) => Prom
 
 The whole of `/complete`, with what's held at each moment:
 
-```
- API request                       Postgres (conn #k)                  S3 / RustFS        Redis
- ──────────────────────────────────────────────────────────────────────────────────────────────────
- loadOwnUpload (plain reads)       SELECT video, SELECT role
- parts check (in memory)
- withUploadLock ─────────────────► BEGIN                                                    ┐
-                                   SELECT … WHERE status='UPLOADING'                        │ row 42
-                                     FOR UPDATE           ── row 42 locked ──┐              │ locked,
-   completeUpload ─────────────────────────────────────────────────────────► stitch parts  │ conn #k
-   getStoredSize  ─────────────────────────────────────────────────────────► HEAD object   │ borrowed
-   transition(…, tx) ────────────► UPDATE … SET status='PROCESSING'          │              │
-                                     WHERE id=42 AND status='UPLOADING'      │              │
-                                   COMMIT ────────────── row 42 unlocked ────┘              ┘
- enqueueTranscode ─────────────────────────────────────────────────────────────────────────► add job
- 201 response
+```mermaid
+sequenceDiagram
+    participant API as API request
+    participant PG as Postgres (conn k)
+    participant S3 as S3 / RustFS
+    participant R as Redis
+    API->>PG: loadOwnUpload: SELECT video, SELECT role (plain reads)
+    API->>API: parts check (in memory)
+    rect rgba(255, 170, 0, 0.15)
+    Note over API,PG: withUploadLock: row 42 locked, conn k borrowed
+    API->>PG: BEGIN
+    API->>PG: SELECT … WHERE status='UPLOADING' FOR UPDATE
+    API->>S3: completeUpload (stitch the parts)
+    API->>S3: getStoredSize (HEAD object)
+    API->>PG: transition(…, tx): UPDATE … SET status='PROCESSING'<br/>WHERE id=42 AND status='UPLOADING'
+    API->>PG: COMMIT (row 42 unlocked)
+    end
+    API->>R: enqueueTranscode → add job
+    Note over API: 200 response
 ```
 
 Each piece, and why:
@@ -314,9 +364,13 @@ if (actual !== declared) {
 }
 ```
 
-```
- inside the callback:  transition → ERROR   then   return { sizeMismatch }   → COMMIT  ✔ ERROR persists
- after the callback:   if (outcome.sizeMismatch) throw BadRequestError       → 400 to the client
+```mermaid
+flowchart LR
+    subgraph IN["inside the callback"]
+        A["transition → ERROR"] --> B["return { sizeMismatch }"]
+    end
+    B -->|"COMMIT ✔ ERROR persists"| C["after the callback:<br/>if (outcome.sizeMismatch) throw BadRequestError"]
+    C --> D(["400 to the client"])
 ```
 
 If it threw `BadRequestError` inside the callback, Drizzle would `ROLLBACK`, the ERROR transition would vanish, and the video would sit in `UPLOADING` with its object already deleted. **Return what happened from inside the transaction, and decide the HTTP error outside it.**
@@ -327,12 +381,16 @@ If `completeUpload` succeeds but `getStoredSize` then throws (say, a network bli
 
 ## 4. Abort or expire an upload
 
-```
- BEGIN
- SELECT video WHERE status='UPLOADING' FOR UPDATE   ── row locked
- S3 AbortMultipartUpload  (NoSuchUpload is fine: already gone)
- UPDATE … SET status='ERROR' WHERE status='UPLOADING'
- COMMIT
+```mermaid
+sequenceDiagram
+    participant API as abort / expire
+    participant PG as Postgres
+    participant S3 as RustFS
+    API->>PG: BEGIN
+    API->>PG: SELECT video WHERE status='UPLOADING' FOR UPDATE (row locked)
+    API->>S3: AbortMultipartUpload (NoSuchUpload is fine: already gone)
+    API->>PG: UPDATE … SET status='ERROR' WHERE status='UPLOADING'
+    API->>PG: COMMIT
 ```
 
 It's the same shape as complete. Because both go through `withUploadLock`, complete and abort on the same video **queue up behind each other**, and the second always sees the first's result. The recovery script `videos:expire-uploads` calls the same `expireUpload`, so a user finishing an upload at the moment the script expires it is safe too.
@@ -347,13 +405,25 @@ UPDATE club_invitations SET status = $2, responded_at = now()
 RETURNING club_id, role;
 ```
 
-```
- acceptForUser                                  acceptForNewUser
- BEGIN                                          BEGIN
- claim → 1 row (or 0 → return false)            claim → 1 row (or 0 → return undefined)
- INSERT club_members ON CONFLICT DO NOTHING     INSERT users           ── may hit unique(email) → 23505
- COMMIT                                         INSERT club_members
-                                                COMMIT
+```mermaid
+sequenceDiagram
+    participant S as Invitation service
+    participant PG as Postgres
+    rect rgba(0, 200, 0, 0.1)
+    Note over S,PG: acceptForUser
+    S->>PG: BEGIN
+    S->>PG: claim → 1 row (0 → return false)
+    S->>PG: INSERT club_members ON CONFLICT DO NOTHING
+    S->>PG: COMMIT
+    end
+    rect rgba(0, 150, 255, 0.12)
+    Note over S,PG: acceptForNewUser
+    S->>PG: BEGIN
+    S->>PG: claim → 1 row (0 → return undefined)
+    S->>PG: INSERT users (may hit unique(email) → 23505 → everything rolls back)
+    S->>PG: INSERT club_members
+    S->>PG: COMMIT
+    end
 ```
 
 - **Two people clicking accept on the same link:** both run `claim`, the second waits on the row lock, re-checks `status='pending'`, gets 0 rows → "invalid invitation".
@@ -373,11 +443,19 @@ RETURNING club_id, role;
 
 The pattern for unique indexes:
 
-```
- request 1: SELECT email → none ─┐
- request 2: SELECT email → none ─┤  both pass the friendly pre-check
- request 1: INSERT → ok          │
- request 2: INSERT → 23505 ──────┘  the index is the real guard → 409 EMAIL_TAKEN
+```mermaid
+sequenceDiagram
+    participant R1 as Request 1
+    participant PG as Postgres
+    participant R2 as Request 2
+    R1->>PG: SELECT email
+    PG-->>R1: none
+    R2->>PG: SELECT email
+    PG-->>R2: none (both pass the friendly pre-check)
+    R1->>PG: INSERT
+    PG-->>R1: ok
+    R2->>PG: INSERT
+    PG-->>R2: 23505 → 409 EMAIL_TAKEN (the index is the real guard)
 ```
 
 ---
@@ -395,11 +473,13 @@ The pattern for unique indexes:
 
 **Compensating action vs rollback.** Postgres can undo a statement; an external system can't be rolled back, so you undo it by hand:
 
-```
- initiateUpload:
-   S3 CreateMultipartUpload → uploadId
-   INSERT videos  ── fails ──► catch: S3 AbortMultipartUpload(uploadId) ── "undo by hand"
-                                       (if that fails too: it's logged as an orphaned upload)
+```mermaid
+flowchart TD
+    A["initiateUpload"] --> B["S3 CreateMultipartUpload → uploadId"]
+    B --> C{"INSERT videos"}
+    C -->|"ok"| D(["upload ready"])
+    C -->|"fails"| E["catch: S3 AbortMultipartUpload(uploadId)<br/>undo by hand"]
+    E -->|"that fails too"| F["logged as an orphaned upload"]
 ```
 
 The order is chosen so that the failure that's left over is harmless. An S3 session with no row only wastes some storage and is logged with its key and uploadId. A row with no session would be a video the user can never finish. (A bucket lifecycle rule, `AbortIncompleteMultipartUpload`, would clean such sessions up automatically; we don't have one yet.)
