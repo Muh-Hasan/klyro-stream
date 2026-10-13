@@ -189,7 +189,7 @@ One sprint at a time, no calendar. A sprint is done when its checklist is ticked
 | S3 Google and clubs | Sign in with Google, create a club, invite a member | Not started |
 | S4 Uploads | Upload a 1 GB file, kill it mid-way, resume it | Not started |
 | S5 Job queue | Jobs flow and retry in Bull Board | Done (GIF pending) |
-| S6 Transcoding | Raw video in, playable HLS out | Not started |
+| S6 Transcoding | Raw video in, playable HLS out | Done (GIF pending) |
 | S7 Library and playback | Search, stream and download through the API | Not started |
 | S8 Real-time and email | Upload in one client, live "ready" event in another | Not started |
 | S9 Observability | Live Grafana dashboard and log search | Not started |
@@ -932,12 +932,12 @@ export const runFfmpeg = (args: string[], durationS: number, onProgress: (pct: n
   });
 ```
 
-- [ ] Worker container has FFmpeg; API container does not need it
-- [ ] No upscaling; renditions match the source
-- [ ] Progress, READY and ERROR all visible
-- [ ] Temp files always cleaned up; a bad file never crashes the worker
-- [ ] Processing time recorded in `docs/NOTES.md`
-- [ ] README: architecture diagram (Mermaid) of upload → queue → worker → storage
+- [x] Worker container has FFmpeg; API container does not need it
+- [x] No upscaling; renditions match the source
+- [x] Progress, READY and ERROR all visible
+- [x] Temp files always cleaned up; a bad file never crashes the worker
+- [x] Processing time recorded in `docs/NOTES.md`
+- [x] README: architecture diagram (Mermaid) of upload → queue → worker → storage
 - [ ] Demo GIF of raw video in, adaptive stream out — then start applying
 
 ## Sprint 7 — Library, playback and downloads

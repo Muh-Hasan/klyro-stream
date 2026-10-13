@@ -470,7 +470,7 @@ flowchart LR
 | 4. Thumbnail | Done | `worker/pipeline/thumbnail.ts`: `thumbnailTime`, `makeThumbnail` |
 | 5. Upload outputs | Done | `lib/storage/objects.ts` (`uploadObject`), `worker/pipeline/upload.ts` (`uploadDir`, `uploadFile`, `contentTypeFor`) |
 | 6. Wire the processor | Done | `worker/video.processor.ts`, `worker.ts`, `services/video.service.ts` (`outputKeys`, `markVideoReady`, `deleteVideoOutputs`), `lib/storage/objects.ts` (`deletePrefix`) |
-| 7. Prove it | | hls.js with a throttled network, "minutes per GB" |
+| 7. Prove it | Done (GIF pending) | `scripts/hls-player.ts` (`npm run videos:play`): READY list, hls.js player, quality log, built-in network throttle. Results in [NOTES.md](../NOTES.md) |
 
 ### Thumbnail (Stage 4)
 
