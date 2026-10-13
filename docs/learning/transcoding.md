@@ -4,7 +4,9 @@ Sprint 6 turns the raw upload into something every viewer can play. This guide e
 
 The numbers below were **measured on this project**: the 4K sample in `bruno/videos/fixtures/`, FFmpeg 9 on Windows, 8 cores, `-preset veryfast`.
 
-Related: [queues.md](queues.md) (jobs, retries, flows) · [uploads.md](uploads.md) (how the raw file got into RustFS).
+Related: [queues.md](queues.md) (jobs, retries, flows) · [uploads.md](uploads.md) (how the raw file got into RustFS) · [NOTES.md](../NOTES.md) (measurements).
+
+**Reviewing Sprint 6?** Read sections 1–9 for the concepts (HLS, the ladder, keyframes, FFmpeg, single job vs Flow vs step job), section 10 for how the pipeline behaves and how it was tested, then [section 11](#11-code-walkthrough-reviewing-sprint-6) with the code open: it goes through every file in reading order and ends with a review checklist.
 
 **Contents**
 
@@ -18,7 +20,8 @@ Related: [queues.md](queues.md) (jobs, retries, flows) · [uploads.md](uploads.m
 8. [Probing the input first](#8-probing-the-input-first)
 9. [One job or a Flow? Measured](#9-one-job-or-a-flow-measured)
 10. [The Sprint 6 pipeline](#10-the-sprint-6-pipeline)
-11. [Glossary and further reading](#11-glossary-and-further-reading)
+11. [Code walkthrough: reviewing Sprint 6](#11-code-walkthrough-reviewing-sprint-6)
+12. [Glossary and further reading](#12-glossary-and-further-reading)
 
 ---
 
@@ -506,7 +509,7 @@ An unknown extension is an error, and `uploadDir` checks every file **before** u
 
 **Keys:** `hls-output/<videoId>/master.m3u8`, `hls-output/<videoId>/720p/seg_000.ts`, `thumbnails/<videoId>.jpg`. The folder layout is uploaded unchanged, so the relative paths inside the playlists keep working. On Windows, `path.relative` returns `720p\seg_000.ts`; the key is rebuilt with `/`, because S3 keys always use forward slashes.
 
-**Concurrency without a library.** `uploadDir` starts 4 small loops that each take the next file from a shared index until none are left. Node runs them on one thread, so `files[next++]` never hands the same file to two loops. Plain `PutObject` is enough because the largest file is a ~3.5 MB segment; multipart only pays off for large objects. The first failure sets a flag that stops the other loops, so no upload lands after the job has given up.
+**Concurrency without a library.** `uploadDir` starts 4 small loops that each take the next file from a shared index until none are left. Node runs them on one thread, so `files[next++]` never hands the same file to two loops. Plain `PutObject` is enough because the largest file is a ~3.5 MB segment; multipart only pays off for large objects. The first failure is remembered and stops the loops from starting new uploads, but `uploadDir` still **waits for the uploads already in flight** before throwing. Otherwise they could land after the processor has deleted the partial output (see the code walkthrough, [upload.ts](#uploadts-a-worker-pool-without-a-library)).
 
 **A bug found by measuring.** The first version reported 12.2 MB uploaded for a 36.7 MB folder:
 
@@ -583,7 +586,864 @@ That's `secondsPerGb: 178`, about **3 minutes per GB**, for a 4K H.264 source on
 
 **Download speed, for the record:** the 229 MB raw object streamed from RustFS to disk in 1.2–2.5 s. The transcode (46 s for 32 s of 4K) is roughly 20–40× the download, so the download is not worth optimising.
 
-## 11. Glossary and further reading
+## 11. Code walkthrough: reviewing Sprint 6
+
+This section goes through **every file Sprint 6 added or changed**, in the order that makes them easiest to understand: from the container up to the processor that ties everything together. For each file: what it's for, the code that matters, why it's written that way, and how to check it yourself.
+
+### Reading order
+
+```mermaid
+flowchart TD
+    A["1 · Dockerfile, .dockerignore,<br/>docker-compose.yml"] --> B["2 · lib/storage/objects.ts<br/>S3 building blocks"]
+    B --> C["3 · pipeline/download.ts"]
+    C --> D["4 · pipeline/probe.ts"]
+    D --> E["5 · pipeline/transcode.ts"]
+    E --> F["6 · pipeline/thumbnail.ts"]
+    F --> G["7 · pipeline/upload.ts"]
+    G --> H["8 · queues.ts, video.service.ts,<br/>video.repository.ts"]
+    H --> I["9 · worker/video.processor.ts<br/>ties it all together"]
+    I --> J["10 · worker.ts<br/>shutdown"]
+    J --> K["11 · scripts/hls-player.ts<br/>dev player"]
+```
+
+| # | File | Lines | Kind |
+|---|---|---|---|
+| 1 | `backend/Dockerfile`, `backend/.dockerignore`, `docker-compose.yml` (worker) | ~70 | Infrastructure |
+| 2 | `src/lib/storage/objects.ts` | 86 | Storage layer: no job or video knowledge |
+| 3–7 | `src/worker/pipeline/*.ts` | ~365 | Pure steps: paths in, results out, no job knowledge |
+| 8 | `src/lib/queue/queues.ts`, `src/services/video.service.ts`, `src/repositories/video.repository.ts` | ~30 changed | Types, row transitions, output keys |
+| 9 | `src/worker/video.processor.ts` | 180 | Orchestration and failure policy |
+| 10 | `src/worker.ts` | 10 changed | Shutdown order |
+| 11 | `src/scripts/hls-player.ts` | 211 | Dev-only tool |
+
+### The layering rule
+
+```mermaid
+flowchart LR
+    P["video.processor.ts<br/><b>knows about jobs</b><br/>retries, checkpoint, ERROR"] --> PL["pipeline/*<br/><b>knows about files</b><br/>FFmpeg, ffprobe, keys"]
+    P --> S["video.service.ts<br/><b>knows about videos</b><br/>READY / ERROR, output keys"]
+    PL --> O["lib/storage/objects.ts<br/><b>knows about S3</b>"]
+    S --> O
+    S --> R["video.repository.ts<br/><b>knows about SQL</b>"]
+```
+
+Each layer only calls the one to its right. That's why `transcode.ts` can be tested with a local file and no Redis, and why switching to a Flow later only touches the processor ([section 9](#so-can-we-use-flows-yes-where-they-fit)).
+
+---
+
+### 1. Containers
+
+#### `backend/Dockerfile`
+
+```dockerfile
+FROM node:24-slim AS base
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM deps AS build
+COPY tsconfig.json tsconfig.build.json ./
+COPY src ./src
+RUN npm run build
+
+FROM base AS prod-deps
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+FROM base AS api
+…
+FROM base AS worker
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+ENV NODE_ENV=production
+COPY package.json ./
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+USER node
+CMD ["node", "--enable-source-maps", "dist/worker.js"]
+```
+
+**Multi-stage build.** Each `FROM … AS name` starts a fresh image. Later stages copy only what they need from earlier ones (`COPY --from=build`). Everything else, like TypeScript, ESLint and the dev dependencies, is thrown away.
+
+```mermaid
+flowchart LR
+    base["base<br/>node:24-slim"] --> deps["deps<br/>npm ci (all)"] --> build["build<br/>tsc → dist/"]
+    base --> prod["prod-deps<br/>npm ci --omit=dev"]
+    base --> api["api · 458 MB"]
+    base --> worker["worker · 1.1 GB<br/>+ ffmpeg"]
+    prod -. node_modules .-> api & worker
+    build -. dist .-> api & worker
+```
+
+| Line | Why |
+|---|---|
+| `COPY package.json package-lock.json` **before** `COPY src` | Docker caches each step. A step reruns only if its inputs changed, and so does every step after it. Copying only the lockfile first means `npm ci` is reused until dependencies change. A code edit rebuilds in ~13 s instead of minutes |
+| `npm ci` (not `npm install`) | Installs exactly what the lockfile says, fails if `package.json` and the lockfile disagree |
+| `prod-deps` as its own stage | `--omit=dev` leaves out tsx, ESLint and `pino-pretty`. Running from `base`, it builds in parallel with `deps` |
+| `worker` starts `FROM base`, installs FFmpeg **first**, copies code **last** | The plan's version did `FROM api AS worker` and installed FFmpeg after the code. Then every code change would reinstall FFmpeg (~4.5 min). Slow-changing things go above fast-changing things |
+| `--no-install-recommends`, `rm -rf /var/lib/apt/lists/*` | Skip optional packages and apt's download cache: smaller image |
+| `USER node` | The process runs as uid 1000, not root. The copied files stay owned by root, so the process **can't change its own code** |
+| `CMD ["node", …]` (exec form, a JSON array) | Node is the container's main process and receives SIGTERM directly. `CMD node dist/worker.js` (shell form) would start `/bin/sh` first, which doesn't forward signals |
+| `--enable-source-maps` | Stack traces point at `.ts` lines instead of compiled `.js` |
+| `ENV NODE_ENV=production` | The logger prints JSON instead of using `pino-pretty`, which isn't installed in the image |
+
+**Check it yourself:** `docker compose build worker` twice. The second time every step says `CACHED`. Edit any `.ts` file and build again: only `build` and the final `COPY` rerun.
+
+#### `backend/.dockerignore`
+
+```text
+node_modules
+dist
+coverage
+.env
+.env.*
+.upload-state
+*.log
+Dockerfile
+.dockerignore
+```
+
+`docker build` first sends the whole folder (the "build context") to Docker. Without this file it would send your Windows `node_modules` (wrong platform for Linux, and huge) and your `.env` **secrets** into the image.
+
+#### The `worker` service in `docker-compose.yml`
+
+```yaml
+worker:
+  build: { context: ./backend, target: worker }
+  profiles: [worker]
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 40s
+  env_file: ./backend/.env
+  environment:
+    NODE_ENV: production
+    FAIL_RATE: '0'
+    DATABASE_URL: postgresql://klyro:klyro_dev@postgres:5432/klyro
+    REDIS_URL: redis://redis:6379
+    S3_ENDPOINT: http://rustfs:9000
+    SMTP_HOST: mailpit
+    SMTP_PORT: '1025'
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    rustfs: { condition: service_healthy }
+```
+
+| Key | Why |
+|---|---|
+| `target: worker` | Build only the `worker` stage of the Dockerfile |
+| `profiles: [worker]` | A plain `docker compose up -d` does **not** start it. Your local `npm run dev:worker` and a container worker would otherwise compete for the same jobs, and the container runs whatever code it was last built with. Start it on purpose: `docker compose up -d worker` |
+| `env_file` + `environment` | Take the secrets from your `.env`, then override what differs inside Docker. `environment` wins over `env_file` |
+| `postgres:5432`, `redis:6379`, `rustfs:9000` | Inside Compose's network, containers reach each other by **service name** and **internal port**. `localhost` inside the container means the container itself. Note `5432`, not the `5433` you use from Windows |
+| `init: true` | Adds tini as process 1. Process 1 must collect finished child processes ("reap zombies"); Node doesn't do that. The worker starts FFmpeg children, so this matters |
+| `stop_grace_period: 40s` | Docker sends SIGTERM, then SIGKILL after this time (default 10 s). Our shutdown can take up to 30 s |
+| `depends_on … service_healthy` | Don't start until the healthchecks pass |
+| `FAIL_RATE: '0'` | With `NODE_ENV=production`, `env.ts` refuses to boot unless it's 0 |
+
+**Check it yourself:** `docker compose up -d worker`, then `docker compose exec worker sh -c 'id; ffmpeg -version | head -1; cat /proc/1/comm'`. Expected: `uid=1000(node)`, FFmpeg 5.1, `docker-init`.
+
+---
+
+### 2. `lib/storage/objects.ts`: the S3 building blocks
+
+These functions know about buckets, keys and files, and nothing about videos or jobs. That's what lets the pipeline, the service and the dev player all share them.
+
+#### `downloadObject`: streaming to disk
+
+```ts
+const { Body, ContentLength } = await s3.send(
+  new GetObjectCommand({ Bucket: bucket, Key: key }),
+  { abortSignal: signal },
+);
+if (!(Body instanceof Readable)) throw new Error(`GetObject ${key} returned no stream`);
+
+await pipeline(Body, createWriteStream(filePath), { signal });
+
+const { size } = await stat(filePath);
+if (ContentLength !== undefined && size !== ContentLength) {
+  throw new Error(`Downloaded ${size} of ${ContentLength} bytes for ${key}`);
+}
+return size;
+```
+
+- **Streaming, not buffering.** `Body` is a stream of chunks. `pipeline` passes each chunk to the file as it arrives, so a 5 GB video uses a few MB of memory, not 5 GB. (`await Body.transformToByteArray()` would load it all into RAM.)
+- **Backpressure.** If the disk is slower than the network, `pipeline` pauses reading until the disk catches up. Writing chunks by hand with `.on('data')` would ignore that and pile data up in memory.
+- **`pipeline` vs `.pipe()`.** `.pipe()` doesn't forward errors or clean up: a network error leaves the file stream open. `pipeline` destroys every stream on any error and rejects the promise.
+- **`Body instanceof Readable`.** The SDK types `Body` loosely (it could be a browser stream). The check narrows the type without an unsafe cast, and fails loudly if it's ever not a Node stream.
+- **Size check on disk.** A connection that closes early can end the stream "successfully". Comparing the file size with `ContentLength` catches a truncated download before FFmpeg wastes time on it.
+- **`signal`.** One `AbortSignal` cancels both the HTTP request and the file write (see [the abort signal path](#one-abortsignal-through-every-layer)).
+
+#### `uploadObject`
+
+```ts
+const { size } = await stat(filePath);
+await s3.send(
+  new PutObjectCommand({
+    Bucket: bucket, Key: key,
+    Body: createReadStream(filePath),
+    ContentLength: size,
+    ContentType: contentType,
+  }),
+  { abortSignal: signal },
+);
+```
+
+- **`ContentLength` is required with a stream body.** S3 needs the size up front; from a stream the SDK can't know it.
+- **`ContentType`** is stored with the object and sent back on every GET. That's what players read ([section 10, Upload](#upload-stage-5)).
+- When you run it, the SDK logs `An error was encountered in a non-retryable streaming request` for a failing upload. A stream can only be read once, so the SDK can't retry it on its own. That's fine: the whole job is retried by BullMQ.
+
+#### `deletePrefix`: pagination
+
+```ts
+do {
+  const page = await s3.send(new ListObjectsV2Command({ Bucket, Prefix, ContinuationToken: token }));
+  const objects = (page.Contents ?? []).flatMap((o) => (o.Key ? [{ Key: o.Key }] : []));
+  if (objects.length > 0) {
+    await s3.send(new DeleteObjectsCommand({ Bucket, Delete: { Objects: objects, Quiet: true } }));
+    deleted += objects.length;
+  }
+  token = page.IsTruncated ? page.NextContinuationToken : undefined;
+} while (token);
+```
+
+S3 has no "delete folder". A "folder" is just keys sharing a prefix. `ListObjectsV2` returns at most **1,000 keys per page**, and `DeleteObjects` accepts at most 1,000 per call, so the loop handles one page at a time until `IsTruncated` is false. A 2-hour video has ~1,200 segments per rendition, so this isn't theoretical. `flatMap` with `[]` both filters out entries without a key and maps the rest, and TypeScript understands the result has no `undefined`.
+
+#### `openObject`
+
+Same as the first half of `downloadObject`, but returns the stream and its type for someone else to pipe. Only the dev player uses it.
+
+---
+
+### 3. `pipeline/download.ts`: translating errors at the boundary
+
+```ts
+export const downloadSource = async (rawPath: string, filePath: string, signal?: AbortSignal) => {
+  try {
+    return await downloadObject(BUCKETS.raw, rawPath, filePath, signal);
+  } catch (err) {
+    if (storageErrorName(err) === 'NoSuchKey') {
+      throw new UnrecoverableError(`Source object ${rawPath} does not exist`);
+    }
+    throw err;
+  }
+};
+```
+
+The storage layer doesn't know about BullMQ, so it can't decide what's retryable. This thin wrapper does: a **missing object** will be missing on every attempt, so it becomes `UnrecoverableError` (no retries). A network error stays a plain error, which is retried.
+
+`return await` inside `try` matters: without `await`, the promise would be returned *before* it rejects, and the `catch` would never see the error.
+
+---
+
+### 4. `pipeline/probe.ts`: running ffprobe safely
+
+#### Three ways to run a program from Node
+
+| Function | Shell? | Output | Used for |
+|---|---|---|---|
+| `exec('ffprobe ' + file)` | **Yes** | Buffered | Never here: the shell parses the string, so a file name like `a; rm -rf /` runs a second command |
+| `execFile('ffprobe', [args])` | No | Buffered, returned at the end | **ffprobe**: small JSON output, finishes in milliseconds |
+| `spawn('ffmpeg', [args])` | No | Streamed while running | **FFmpeg**: runs for minutes, and we read progress as it goes |
+
+With no shell, each array element reaches the program as exactly one argument. Spaces, quotes and semicolons in a file name are just characters.
+
+```ts
+const exec = promisify(execFile);
+
+const { stdout } = await exec('ffprobe', [...PROBE_ARGS, path.basename(filePath)], {
+  cwd: path.dirname(filePath),
+  signal,
+  maxBuffer: 4 * 1024 * 1024,
+});
+```
+
+- `promisify` turns the callback-style `execFile` into a function that returns a promise.
+- `cwd` + `basename`: ffprobe runs **inside** the temp folder and is given just `source`. Its error messages then say `source: Invalid data…` instead of `/tmp/klyro/video-…/source`, and those messages can reach users.
+- `maxBuffer`: `execFile` keeps all output in memory and kills the program if it exceeds this. 4 MB is far more than a JSON description needs.
+
+#### Validating the output with Zod
+
+```ts
+const probeOutput = z.object({
+  streams: z.array(z.object({
+    codec_type: z.string(),
+    codec_name: z.string().optional(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    duration: z.coerce.number().optional(),
+    side_data_list: z.array(z.object({ rotation: z.number().optional() })).optional(),
+  })),
+  format: z.object({ duration: z.coerce.number().optional() }),
+});
+```
+
+ffprobe's JSON comes from outside our code, just like a request body, so it's validated the same way. Two details:
+
+- `z.coerce.number()` for `duration`: ffprobe prints durations as **strings** (`"31.880000"`) but sizes as numbers.
+- Only the fields we use are listed. Zod ignores the rest (ffprobe prints dozens).
+
+#### The decisions after parsing
+
+```ts
+const video = streams.find((s) => s.codec_type === 'video' && s.width && s.height);
+if (!video?.width || !video.height) throw new UnrecoverableError('File has no video stream');
+
+const durationSeconds = format.duration ?? video.duration;
+
+const rotation = Math.abs(video.side_data_list?.find((d) => d.rotation !== undefined)?.rotation ?? 0);
+const sideways = rotation === 90 || rotation === 270;
+return {
+  width: sideways ? video.height : video.width,
+  height: sideways ? video.width : video.height,
+  …
+};
+```
+
+- The container's duration (`format.duration`) is preferred; some files only have it on the stream.
+- **Rotation:** a phone stores portrait video as landscape pixels plus "rotate −90°". We return the size **the viewer sees**, because FFmpeg applies the rotation when encoding.
+- **Error classification** in `runProbe`'s `catch`:
+  - `ENOENT` (ffprobe isn't installed) → rethrown as-is → **retried**. It's the machine's fault, not the video's.
+  - Aborted (shutdown) → rethrown as-is.
+  - Anything else (ffprobe exited non-zero) → `UnrecoverableError` with the last 300 characters of its error output, newlines collapsed.
+
+**Check it yourself:** `ffprobe -v error -print_format json -show_format -show_streams bruno/videos/fixtures/sample-video.mp4` and find the fields the schema reads.
+
+---
+
+### 5. `pipeline/transcode.ts`: the ladder and FFmpeg
+
+Four exports: two **pure** functions (`planRenditions`, `buildHlsArgs`) that only compute, and two that run FFmpeg (`runFfmpeg`, `transcodeHls`). Keeping the decisions pure means you can check them by calling them, without FFmpeg.
+
+#### `planRenditions`: which sizes to make
+
+```ts
+const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+
+export const planRenditions = ({ width, height }) => {
+  const shortSide = Math.min(width, height);
+  const fits = LADDER.filter((rung) => rung.shortSide <= shortSide);
+  const rungs = fits.length > 0 ? fits : [{ ...LADDER[2], name: `${even(shortSide)}p`, shortSide }];
+
+  return rungs.map((rung) => {
+    const scale = rung.shortSide / shortSide;
+    return { name: rung.name, width: even(width * scale), height: even(height * scale), … };
+  });
+};
+```
+
+Worked through for the 4K sample (3840×2160):
+
+| Step | Value |
+|---|---|
+| `shortSide` | min(3840, 2160) = 2160 |
+| `fits` | all three rungs (1080, 720, 480 ≤ 2160) |
+| 1080p: `scale` = 1080 / 2160 = 0.5 | 3840 × 0.5 = **1920**, 2160 × 0.5 = **1080** |
+| 720p: `scale` = 0.333… | 1280 × 720 |
+| 480p: `scale` = 0.222… | 3840 × 0.222 = 853.3 → `even` → **854** × 480 |
+
+And for a portrait 1080×1920 phone video: `shortSide` = 1080, so the renditions are 1080×1920, 720×1280, 480×854. The short side decides, so a portrait video is never upscaled.
+
+- `even()`: H.264 with 4:2:0 colour needs even width and height. `Math.max(2, …)` guards against a nonsense 0.
+- A source smaller than 480 (e.g. 640×360) matches no rung, so it gets one rendition at its own size, named `360p`, with the 480p bitrates.
+
+#### `buildHlsArgs`: the argument array
+
+The real output for the 4K sample (one array element per line group):
+
+```text
+-y -i /tmp/klyro/video-abc/source
+-filter_complex [0:v]split=3[v0][v1][v2];[v0]scale=1920:1080[o0];[v1]scale=1280:720[o1];[v2]scale=854:480[o2]
+-map [o0] -map 0:a:0   -map [o1] -map 0:a:0   -map [o2] -map 0:a:0
+-c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p
+-force_key_frames expr:gte(t,n_forced*6) -sc_threshold 0
+-c:a aac -ac 2
+-b:v:0 5000k -maxrate:v:0 5350k -bufsize:v:0 10000k -b:a:0 128k
+-b:v:1 2800k -maxrate:v:1 2996k -bufsize:v:1 5600k  -b:a:1 128k
+-b:v:2 1400k -maxrate:v:2 1498k -bufsize:v:2 2800k  -b:a:2 96k
+-f hls -hls_time 6 -hls_playlist_type vod -hls_flags independent_segments
+-hls_segment_filename %v/seg_%03d.ts -master_pl_name master.m3u8
+-var_stream_map v:0,a:0,name:1080p v:1,a:1,name:720p v:2,a:2,name:480p
+%v/index.m3u8
+```
+
+Section 7 explains each option. Things specific to the code:
+
+- `flatMap` builds the repeated parts (`-map`, rates) once per rendition and flattens them into the array.
+- `...(hasAudio ? [...] : [])` adds audio options only when there is audio. Mapping `0:a:0` on a silent file makes FFmpeg fail, so every audio part is conditional: maps, `-c:a`, `-b:a:i` and the `a:i` in `var_stream_map`.
+- `-var_stream_map` is **one** array element containing spaces. With a shell you'd need quotes; with `spawn` it simply arrives as one argument.
+
+**Check it yourself:** the ladders in [section 7's table](#in-the-code-srcworkerpipelinetranscodets) came from calling `planRenditions` directly.
+
+#### `runFfmpeg`: wrapping a child process in a promise
+
+```ts
+export const runFfmpeg = (args, { cwd, durationSeconds, onProgress, signal }) =>
+  new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      'ffmpeg',
+      ['-hide_banner', '-nostats', '-loglevel', 'error', '-progress', 'pipe:1', ...args],
+      { cwd, signal, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    …
+    child.once('error', reject);
+    child.once('close', (code, killedBy) => { … });
+  });
+```
+
+A child process is an **event emitter**, not a promise. `new Promise` turns its events into one result:
+
+```mermaid
+flowchart LR
+    S["spawn"] --> OUT["stdout 'data'<br/>progress lines"]
+    S --> ERR["stderr 'data'<br/>keep last 2 KB"]
+    S --> E["'error'<br/>couldn't start (ENOENT)<br/>or aborted"] --> REJ1(["reject"])
+    S --> C["'close' (code)"]
+    C -- "0" --> RES(["resolve"])
+    C -- "aborted" --> REJ2(["reject: stopped"])
+    C -- "stderr says bad input" --> REJ3(["reject: UnrecoverableError"])
+    C -- "anything else" --> REJ4(["reject: Error (retried)"])
+```
+
+| Part | Why |
+|---|---|
+| `stdio: ['ignore', 'pipe', 'pipe']` | No input; we read stdout (progress) and stderr (errors) |
+| `-progress pipe:1` | Machine-readable `key=value` progress lines on stdout (pipe 1) |
+| `-nostats -loglevel error` | Turn off the human progress line and info messages on stderr, so stderr holds only real errors |
+| `signal` in `spawn` options | When the signal aborts, Node kills FFmpeg and emits `'error'` with an `AbortError` |
+| `once` instead of `on` | A promise settles once; `once` removes the listener after it fires |
+| `'close'`, not `'exit'` | `'exit'` can fire before stdout and stderr are fully read; `'close'` waits for the streams too, so the last error lines are in `stderr` |
+
+**Reading stdout line by line:**
+
+```ts
+let pending = '';
+child.stdout.on('data', (chunk: string) => {
+  const lines = (pending + chunk).split('\n');
+  pending = lines.pop() ?? '';
+  for (const line of lines) { … }
+});
+```
+
+A `data` chunk is whatever bytes arrived, **not** one line. FFmpeg writes `out_time_us=12345678\n`, but a chunk might end in the middle: `out_time_us=123`. So the last, possibly incomplete piece is kept in `pending` and joined to the start of the next chunk. Without this, progress would occasionally read `123` instead of `12345678`.
+
+**Progress:**
+
+```ts
+const fraction = Math.min(1, Math.max(0, Number(value) / (durationSeconds * 1e6)));
+const percent = Math.floor(fraction * 100);
+if (Number.isFinite(fraction) && percent > lastPercent) {
+  lastPercent = percent;
+  onProgress(fraction);
+}
+```
+
+- `out_time_us` is microseconds of video encoded so far; dividing by the duration in microseconds gives 0–1.
+- FFmpeg sometimes prints `out_time_us=N/A` → `NaN` → skipped by `isFinite`.
+- The callback runs only when the **whole percent goes up**. FFmpeg reports twice a second, and each report becomes a Redis write in `job.updateProgress`, so this caps it at 100 writes per job.
+
+**Error output:** `stderr = (stderr + chunk).slice(-STDERR_TAIL_BYTES)` keeps only the last 2 KB. FFmpeg's error is always at the end, and a long run could otherwise build up a large string.
+
+#### `transcodeHls`
+
+```ts
+const renditions = planRenditions(meta);
+await mkdir(outDir, { recursive: true });
+await runFfmpeg(buildHlsArgs(source, renditions, meta.hasAudio), { cwd: outDir, … });
+return renditions;
+```
+
+`mkdir` first because `spawn` with a `cwd` that doesn't exist fails with `ENOENT`, the same error as "FFmpeg not installed", which would be confusing to debug.
+
+---
+
+### 6. `pipeline/thumbnail.ts`
+
+```ts
+export const thumbnailTime = (durationSeconds: number) =>
+  durationSeconds > SHORT_CLIP_SECONDS ? THUMBNAIL_AT_SECONDS : durationSeconds * 0.1;
+```
+
+`thumbnailTime` is exported on its own so the rule is easy to check: `31.88 → 5`, `3 → 0.3`, `10 → 1`. The FFmpeg call reuses `runFfmpeg`, so it gets the same no-shell spawn, abort and error classification. `at.toFixed(3)` avoids passing `0.30000000000000004` to FFmpeg. The FFmpeg options are explained in [section 10, Thumbnail](#thumbnail-stage-4).
+
+---
+
+### 7. `pipeline/upload.ts`: a worker pool without a library
+
+```ts
+const entries = await readdir(dir, { recursive: true, withFileTypes: true });
+const files = entries.filter((e) => e.isFile()).map((e) => path.join(e.parentPath, e.name));
+files.forEach(contentTypeFor);
+
+let next = 0;
+let bytes = 0;
+let failure: Error | undefined;
+const worker = async () => {
+  while (failure === undefined && next < files.length) {
+    const file = files[next++]!;
+    const key = `${prefix}${path.relative(dir, file).split(path.sep).join('/')}`;
+    try {
+      const size = await uploadFile(file, bucket, key, signal);
+      bytes += size;
+    } catch (err) {
+      failure ??= err instanceof Error ? err : new Error(String(err));
+    }
+  }
+};
+await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, files.length) }, worker));
+if (failure !== undefined) throw failure;
+```
+
+```mermaid
+sequenceDiagram
+    participant L1 as loop 1
+    participant L2 as loop 2
+    participant Q as files[next++]
+    participant S3 as RustFS
+    L1->>Q: take file 0
+    L2->>Q: take file 1
+    L1->>S3: PUT file 0
+    L2->>S3: PUT file 1
+    S3-->>L1: ok
+    L1->>Q: take file 2
+    S3-->>L2: ✖ error → failure = err
+    Note over L2: loop condition false → stops
+    S3-->>L1: ok (file 2 was already in flight)
+    Note over L1: failure set → stops
+    Note over L1,L2: Promise.all resolves only now,<br/>then uploadDir throws the first error
+```
+
+| Detail | Why |
+|---|---|
+| `files.forEach(contentTypeFor)` before uploading anything | An unknown extension throws **before** the first upload, so a stray file can't leave a half-uploaded folder |
+| `files[next++]` is safe with 4 loops | JavaScript runs one piece of code at a time. Between reading `next` and incrementing it there's no `await`, so no other loop can run in between |
+| `const size = await …; bytes += size;` | `bytes += await x` reads `bytes` **before** waiting, so concurrent loops overwrite each other's additions. That bug was measured: 12.2 MB reported for 36.7 MB |
+| Errors are **stored**, not thrown inside the loop | Throwing would make `Promise.all` reject immediately while other uploads are still running. Those could land **after** the processor deleted the partial output, leaving orphans. Now `uploadDir` waits for every in-flight upload, then throws. Measured: after an abort, the object count when `uploadDir` returned was the same 2 s later |
+| `failure ??= …` | Keep only the **first** error (`??=` assigns only if it's still undefined) |
+| `.split(path.sep).join('/')` | On Windows `path.relative` gives `720p\seg_000.ts`; S3 keys must use `/` |
+| `entry.parentPath` | With `recursive: true`, entries come from subfolders; `parentPath` says which one (Node ≥ 20.12) |
+
+---
+
+### 8. Types, the service and the repository
+
+#### `lib/queue/queues.ts`
+
+```ts
+export type TranscodeOutput = { hlsPath: string; thumbnailPath: string; durationSeconds: number };
+
+export type TranscodeJob = {
+  videoId: string;
+  requestId?: string;
+  output?: TranscodeOutput;
+};
+```
+
+`output` is the **checkpoint**. The API never sets it; the worker writes it with `job.updateData` after uploading. It's optional, so jobs enqueued by the API are unchanged.
+
+#### `services/video.service.ts`
+
+```ts
+export const outputKeys = (videoId: string) => ({
+  hlsPrefix: `${videoId}/`,
+  hlsPath: `${videoId}/master.m3u8`,
+  thumbnailPath: `${videoId}.jpg`,
+});
+
+export const markVideoReady = (videoId: string, output: TranscodeOutput) =>
+  videoRepo.transition(videoId, 'PROCESSING', 'READY', output);
+
+export const deleteVideoOutputs = async (videoId: string) => {
+  const keys = outputKeys(videoId);
+  const [segments] = await Promise.all([
+    deletePrefix(BUCKETS.hls, keys.hlsPrefix),
+    deleteObject(BUCKETS.thumbnails, keys.thumbnailPath),
+  ]);
+  return segments;
+};
+```
+
+- **One place decides the storage layout.** The uploader writes to `outputKeys(id)` and the cleanup deletes `outputKeys(id)`. If they were written separately, a typo in one would leave files behind forever. Sprint 7's delete endpoint will reuse it.
+- **`markVideoReady` is one conditional UPDATE**, `… SET status='READY', hls_path=…, thumbnail_path=…, duration_seconds=… WHERE id=… AND status='PROCESSING'`. It returns the row, or `undefined` if the video wasn't PROCESSING any more. A video is never READY without its paths.
+- `Promise.all` deletes the HLS prefix and the thumbnail at the same time. Deleting a thumbnail that doesn't exist is not an error in S3.
+
+#### `repositories/video.repository.ts`
+
+`findByStatus(status, limit)`: a `db.query` entity fetch, newest first. Only the dev player uses it.
+
+---
+
+### 9. `worker/video.processor.ts`: tying it together
+
+The file has four layers, each in its own function:
+
+| Function | Responsibility |
+|---|---|
+| `processVideo` | **Policy:** shutdown? retry? give up? |
+| `transcode` | **Orchestration:** check the row, checkpoint, temp folder, READY |
+| `produce` | **Work:** the five pipeline steps, progress, timing |
+| `failForGood` | **Final failure:** ERROR + careful cleanup |
+
+#### One attempt from start to finish
+
+```mermaid
+sequenceDiagram
+    participant B as BullMQ worker
+    participant PV as processVideo
+    participant T as transcode
+    participant P as produce
+    participant DB as Postgres
+    participant S3 as RustFS
+    B->>PV: job, token
+    PV->>T: transcode(job)
+    T->>DB: findById → must be PROCESSING
+    alt job.data.output exists (earlier attempt uploaded)
+        T->>T: skip produce
+    else first time
+        T->>T: rm + mkdir /tmp/klyro/<jobId>
+        T->>P: produce()
+        P->>S3: download raw
+        P->>P: FAIL_RATE · probe · FFmpeg · thumbnail
+        P->>S3: upload HLS + thumbnail
+        P-->>T: { hlsPath, thumbnailPath, durationSeconds }
+        T->>T: finally: rm temp folder
+        T->>B: job.updateData({ output }) (checkpoint)
+    end
+    T->>DB: markVideoReady (WHERE status = PROCESSING)
+    T-->>PV: result
+    PV-->>B: completed
+```
+
+#### Module-level state
+
+```ts
+const WORK_ROOT = path.join(os.tmpdir(), 'klyro');
+const PROGRESS = { downloaded: 10, transcodeStart: 10, transcodeEnd: 85, thumbnail: 90, uploaded: 100 };
+const shutdown = new AbortController();
+export const stopActiveJobs = () => shutdown.abort();
+```
+
+- `os.tmpdir()` is `/tmp` in the container and `%TEMP%` on Windows, so the same code works in both.
+- **One `AbortController` for the whole process.** Shutting down means stopping *every* active job, so one signal shared by all of them is enough. `worker.ts` calls `stopActiveJobs()`; nothing else does.
+
+#### Small helpers inside `produce`
+
+```ts
+const reporter = (job: Job, log: Logger) => (percent: number) => {
+  void job.updateProgress(Math.round(percent)).catch((err: unknown) => {
+    log.warn({ err }, 'could not report progress');
+  });
+};
+```
+
+`reporter` returns a function that **doesn't wait** for Redis (`void`): FFmpeg's progress callback is synchronous, and a slow Redis write must not slow the transcode. The `.catch` matters: an unhandled rejected promise crashes Node (our `unhandledRejection` handler shuts the worker down). A failed progress update only deserves a warning.
+
+```ts
+const timed = async <T>(phase: string, work: () => Promise<T>) => {
+  const started = performance.now();
+  try {
+    return await work();
+  } finally {
+    timings[phase] = Math.round(performance.now() - started);
+  }
+};
+```
+
+- `<T>` makes it generic: `timed('probe', () => probe(...))` returns a `ProbeResult`, `timed('download', …)` a number, with no casts.
+- `finally` records the time even if the step throws.
+- `performance.now()` is a monotonic clock: it never jumps when the system clock is adjusted, unlike `Date.now()`.
+
+#### The steps in `produce`
+
+```ts
+const sourceBytes = await timed('download', () => downloadSource(rawPath, source, signal));
+progress(PROGRESS.downloaded);
+if (Math.random() < env.FAIL_RATE) throw new Error('Simulated transient failure (FAIL_RATE)');
+
+const meta = await timed('probe', () => probe(source, signal));
+
+const span = PROGRESS.transcodeEnd - PROGRESS.transcodeStart;
+const renditions = await timed('transcode', () =>
+  transcodeHls(source, hlsDir, meta, (f) => progress(PROGRESS.transcodeStart + f * span), signal),
+);
+```
+
+The transcode's 0–1 fraction is mapped onto 10–85 % of the bar: `10 + f × 75`. At `f = 0.5` the bar shows 47.5 → 48 %.
+
+#### `transcode`: the checkpoint and the temp folder
+
+```ts
+let output = job.data.output;
+if (output) {
+  log.info('outputs already uploaded by an earlier attempt, skipping to READY');
+} else {
+  const dir = path.join(WORK_ROOT, String(job.id));
+  await rm(dir, { recursive: true, force: true });
+  await mkdir(dir, { recursive: true });
+  try {
+    output = await produce(job, video.rawPath, dir, log);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  await job.updateData({ ...job.data, output });
+}
+const ready = await videoService.markVideoReady(videoId, output);
+```
+
+- `rm` **before** `mkdir`: if a previous attempt crashed (`kill -9`, power loss), its `finally` never ran and old files may still be there.
+- `rm` in `finally`: runs on success, failure **and** abort.
+- `force: true`: don't fail if the folder is already gone.
+- `job.updateData` happens **after** the temp folder is deleted and **only** after a successful `produce`. A checkpoint means "the outputs are in RustFS", never "they're on this machine's disk".
+- `{ ...job.data, output }` keeps `videoId` and `requestId`; `updateData` replaces the whole data object.
+
+#### `processVideo`: the order of the checks
+
+```ts
+} catch (err) {
+  if (shutdown.signal.aborted) {
+    await job.moveToWait(token);
+    throw new WaitingError();
+  }
+  if (!isFinalAttempt(job, err)) throw err;
+  await failForGood(job, err, log);
+  throw err;
+}
+```
+
+1. **Shutdown first.** When FFmpeg is killed on SIGTERM, the error looks like any other failure. Without this check it would use up an attempt, or, on the last attempt, mark a perfectly good video as ERROR.
+2. `moveToWait(token)` puts the job back in `wait`. The `token` proves this worker owns the job's lock.
+3. `throw new WaitingError()` tells BullMQ "I've already moved this job". BullMQ's `handleFailed` recognises the error type and skips `moveToFailed`, so no attempt is counted.
+4. Otherwise: not the last attempt → rethrow, BullMQ retries after the backoff. Last attempt → `failForGood`, then rethrow so the job shows as failed in Bull Board.
+
+#### `failForGood`: careful cleanup
+
+```ts
+const reason =
+  err instanceof UnrecoverableError ? err.message : `Processing failed after ${job.attemptsMade + 1} attempts`;
+const failed = await videoService.markVideoFailed(videoId, reason).catch(… return undefined);
+
+if (failed) {
+  deletedOutputs = await videoService.deleteVideoOutputs(videoId).catch(… return undefined);
+}
+```
+
+| Guard | What it prevents (all three seen in testing) |
+|---|---|
+| Only `UnrecoverableError` messages reach `error_message` | A Postgres error's message contains the whole SQL statement and its parameters; users would see it |
+| Clean up **only if** `markVideoFailed` returned a row | A duplicate job for a READY video fails with "Video is READY". Deleting outputs then would destroy a working video |
+| Both calls `.catch` and log | Failure handling must not throw a *new* error that hides the original one |
+
+---
+
+### 10. `worker.ts`: shutdown order
+
+```ts
+const closing = videoWorker.close();
+stopActiveJobs();
+await closing;
+```
+
+`close()` is started **first**, which immediately marks the worker as closing so it fetches no new jobs. Only then are active jobs aborted. In the opposite order, the worker could fetch a fresh job in the moment between the abort and the close, and immediately abort it too. `close()` then waits for the aborted jobs to finish their `catch` (`moveToWait`).
+
+#### One `AbortSignal` through every layer
+
+```mermaid
+flowchart TD
+    SIG["SIGTERM"] --> W["worker.ts<br/>stopActiveJobs()"]
+    W --> AC["shutdown.abort()<br/>(video.processor.ts)"]
+    AC --> D["downloadObject<br/>S3 request + file pipeline"]
+    AC --> PR["probe<br/>execFile kills ffprobe"]
+    AC --> FF["runFfmpeg / makeThumbnail<br/>spawn kills FFmpeg"]
+    AC --> UP["uploadObject<br/>S3 requests cancelled"]
+    D & PR & FF & UP --> ERR["AbortError thrown"]
+    ERR --> FIN["finally: temp folder deleted"]
+    FIN --> PV["processVideo: signal.aborted<br/>→ moveToWait + WaitingError"]
+```
+
+`AbortSignal` is Node's standard way to cancel async work. The S3 SDK, `pipeline`, `execFile` and `spawn` all accept one, so a single `abort()` stops whatever the job happens to be doing at that moment.
+
+---
+
+### 11. `scripts/hls-player.ts`: the dev player
+
+Not part of the product: it exists because the buckets are private and Sprint 7 hasn't built signed streaming yet. Run with `npm run videos:play` (options `--port`, `--kbps`).
+
+| Route | Does |
+|---|---|
+| `GET /` | Lists READY videos that have an `hls_path` (the Sprint 5 stub left READY rows without files) |
+| `GET /watch/<uuid>` | The player page: hls.js, quality and bandwidth display, quality and network buttons, event log |
+| `GET /hls/<uuid>/<file>.m3u8\|.ts` | Streams the object from `hls-output`, optionally throttled |
+| `GET /thumb/<uuid>.jpg` | Streams the thumbnail |
+| `POST /throttle?kbps=N` | Sets the throttle for later requests (0 = unlimited) |
+
+Things worth reading in it:
+
+- **Routes are regular expressions** that only accept a UUID and simple file names: `^/hls/(<uuid>)/((?:[\w-]+/)?[\w-]+\.(?:m3u8|ts))$`. `../../etc/passwd` can't match, so it's a 404 before any storage call.
+- **`server.listen(port, '127.0.0.1')`**: only reachable from this machine. It has no authentication, so it must not be on the network.
+- **`escapeHtml`** for video titles: titles are user input, and the page is built as an HTML string.
+- **The throttle** is a `Transform` stream between S3 and the response that delays each chunk by `chunk.length × 8 / kbps` milliseconds. Bits ÷ (kilobits per second) = milliseconds. Measured: a 2.1 MB segment at 1.5 Mbps took 11.8 s (theory 11.25 s).
+- **`req.once('close', () => controller.abort())`**: when the browser cancels a request (closing the tab, seeking, or hls.js abandoning a segment), the S3 download stops too.
+- A bug found while testing it: in the network button handler, `e.currentTarget` was read **after** `await fetch(...)`. Browsers set `currentTarget` to `null` once the event has finished dispatching, so the code now saves it in a variable before the `await`.
+
+---
+
+### Review checklist
+
+Work through these with the code open. Each one has an answer in this section or can be checked with a command.
+
+**Containers**
+
+- [ ] Why does the `worker` stage start `FROM base` instead of `FROM api`?
+- [ ] What would go wrong without `.dockerignore`?
+- [ ] Why `postgres:5432` inside Compose but `localhost:5433` from Windows?
+- [ ] What do `init: true` and `stop_grace_period` each protect against?
+
+**Pipeline**
+
+- [ ] Why does `downloadObject` check the size on disk after `pipeline` finishes?
+- [ ] `exec`, `execFile`, `spawn`: which one is never used, and why?
+- [ ] Which ffprobe failures are retried, and which aren't?
+- [ ] Work out `planRenditions` by hand for 2560×1440 and for 1440×2560.
+- [ ] Why does `runFfmpeg` keep a `pending` string?
+- [ ] Why `'close'` and not `'exit'`?
+- [ ] In `uploadDir`, why can't two loops get the same file? Why is the error stored instead of thrown?
+
+**Processor**
+
+- [ ] Trace a job where the READY update fails once. Which log lines appear, and how long does attempt 2 take?
+- [ ] Why is the checkpoint saved after the upload and not after the transcode?
+- [ ] Why is the shutdown check the **first** thing in `processVideo`'s `catch`?
+- [ ] Give a concrete case where deleting outputs without checking `markVideoFailed`'s result destroys a good video.
+- [ ] Why does `reporter` use `void` *and* `.catch`?
+
+**Try it yourself**
+
+```bash
+docker compose up -d --build worker      # from the repo root; or: cd backend && npm run dev:worker
+docker compose logs -f worker            # watch for "source probed" and "outputs uploaded"
+cd backend && npm run videos:play        # then open http://localhost:4100
+```
+
+- Upload something with `npm run upload -- <file> --club <clubId>` and watch progress in Bull Board.
+- Stop the worker container during a transcode, check the job in Bull Board (`waiting`, attempts 0), start it again.
+- Upload a renamed `.txt` file as a video and look at the `error_message` it ends with.
+
+### Known gaps and follow-ups
+
+| Gap | Why it matters | When |
+|---|---|---|
+| No 360p rung | At 1.5 Mbps even 480p (peak 1.65 Mbps) stalled briefly | Ladder change, small |
+| No automated tests | `planRenditions`, `buildHlsArgs`, `thumbnailTime` and `contentTypeFor` are pure and easy to unit-test | Sprint 11 adds Vitest |
+| FFmpeg 5.1 in the container vs 9.0 on Windows | Different `BANDWIDTH` values in the master playlist; options must work in both | Pin or upgrade when it matters |
+| `maxStalledCount` is BullMQ's default (1) | A job whose worker crashes twice is failed as stalled. Graceful shutdowns don't count (they use `moveToWait`) | Revisit if crashes become common |
+| No `Cache-Control` on HLS objects | Segments never change and could be cached for a year; playlists for short times | With a CDN, later |
+| `secondsPerGb` depends on the source bitrate | A 1080p GB has 4× more video than a 4K GB; time relative to video length is steadier ([NOTES.md](../NOTES.md)) | Log both if needed |
+| 26 READY rows from the Sprint 5 stub have no files | The player filters them out; a real list endpoint should too | Clean up the demo data, or filter in Sprint 7 |
+
+
+## 12. Glossary and further reading
 
 | Term | Meaning |
 |---|---|
