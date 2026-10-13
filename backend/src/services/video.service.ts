@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ClubRole } from '../lib/db/schema.js';
-import { enqueueTranscode } from '../lib/queue/queues.js';
+import { enqueueTranscode, type TranscodeOutput } from '../lib/queue/queues.js';
+import { BUCKETS } from '../lib/storage/client.js';
 import {
   abortUpload,
   completeUpload,
@@ -13,6 +14,7 @@ import {
   startUpload,
   storageErrorName,
 } from '../lib/storage/multipart.js';
+import { deleteObject, deletePrefix } from '../lib/storage/objects.js';
 import * as clubRepo from '../repositories/club.repository.js';
 import * as videoRepo from '../repositories/video.repository.js';
 import type { Membership } from '../types/express.js';
@@ -218,8 +220,23 @@ export const abortVideoUpload = async (videoId: string, userId: string): Promise
 export const expireUpload = (videoId: string, errorMessage: string) =>
   abortLockedUpload(videoId, errorMessage);
 
-export const markVideoReady = (videoId: string) =>
-  videoRepo.transition(videoId, 'PROCESSING', 'READY');
+export const outputKeys = (videoId: string) => ({
+  hlsPrefix: `${videoId}/`,
+  hlsPath: `${videoId}/master.m3u8`,
+  thumbnailPath: `${videoId}.jpg`,
+});
+
+export const markVideoReady = (videoId: string, output: TranscodeOutput) =>
+  videoRepo.transition(videoId, 'PROCESSING', 'READY', output);
 
 export const markVideoFailed = (videoId: string, errorMessage: string) =>
   videoRepo.transition(videoId, 'PROCESSING', 'ERROR', { errorMessage });
+
+export const deleteVideoOutputs = async (videoId: string) => {
+  const keys = outputKeys(videoId);
+  const [segments] = await Promise.all([
+    deletePrefix(BUCKETS.hls, keys.hlsPrefix),
+    deleteObject(BUCKETS.thumbnails, keys.thumbnailPath),
+  ]);
+  return segments;
+};

@@ -2,7 +2,13 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import {
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+} from '@aws-sdk/client-s3';
 import { s3 } from './client.js';
 
 export const downloadObject = async (
@@ -45,4 +51,27 @@ export const uploadObject = async (
     { abortSignal: signal },
   );
   return size;
+};
+
+export const deleteObject = async (bucket: string, key: string): Promise<void> => {
+  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+};
+
+export const deletePrefix = async (bucket: string, prefix: string): Promise<number> => {
+  let deleted = 0;
+  let token: string | undefined;
+  do {
+    const page = await s3.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: token }),
+    );
+    const objects = (page.Contents ?? []).flatMap((o) => (o.Key ? [{ Key: o.Key }] : []));
+    if (objects.length > 0) {
+      await s3.send(
+        new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects, Quiet: true } }),
+      );
+      deleted += objects.length;
+    }
+    token = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (token);
+  return deleted;
 };

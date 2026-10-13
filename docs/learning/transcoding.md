@@ -469,7 +469,7 @@ flowchart LR
 | 3. Transcode | Done | `worker/pipeline/transcode.ts`: `planRenditions`, `buildHlsArgs` (pure), `runFfmpeg` (`spawn`, progress, stop on abort), `transcodeHls` |
 | 4. Thumbnail | Done | `worker/pipeline/thumbnail.ts`: `thumbnailTime`, `makeThumbnail` |
 | 5. Upload outputs | Done | `lib/storage/objects.ts` (`uploadObject`), `worker/pipeline/upload.ts` (`uploadDir`, `uploadFile`, `contentTypeFor`) |
-| 6. Wire the processor | Next | Temp dir, weighted progress, READY/ERROR, SIGTERM stops FFmpeg, the "uploaded" checkpoint |
+| 6. Wire the processor | Done | `worker/video.processor.ts`, `worker.ts`, `services/video.service.ts` (`outputKeys`, `markVideoReady`, `deleteVideoOutputs`), `lib/storage/objects.ts` (`deletePrefix`) |
 | 7. Prove it | | hls.js with a throttled network, "minutes per GB" |
 
 ### Thumbnail (Stage 4)
@@ -522,6 +522,64 @@ bytes += size;
 ```
 
 Measured after the fix: 22 files, 36.7 MB, uploaded in 0.55–0.68 s. Fetching through a presigned URL returned `application/vnd.apple.mpegurl` for `master.m3u8` and `video/mp2t` for `720p/seg_000.ts`.
+
+### The processor (Stage 6)
+
+```mermaid
+flowchart TD
+    START(["attempt starts"]) --> ROW{"row is PROCESSING<br/>and has rawPath?"}
+    ROW -- no --> UNREC["UnrecoverableError"]
+    ROW -- yes --> CP{"job.data.output<br/>already set?"}
+    CP -- "yes (earlier attempt uploaded)" --> READY
+    CP -- no --> TMP["wipe + create /tmp/klyro/&lt;jobId&gt;"]
+    TMP --> PRODUCE["download 0→10 % · FAIL_RATE<br/>probe · transcode 10→85 %<br/>thumbnail →90 % · upload →100 %"]
+    PRODUCE --> RM["finally: delete temp folder"]
+    RM --> SAVE["job.updateData({ output })<br/>checkpoint in Redis"]
+    SAVE --> READY["markVideoReady(paths, duration)<br/>one conditional UPDATE"]
+    READY --> DONE(["completed"])
+    PRODUCE -. "SIGTERM" .-> WAIT["moveToWait + WaitingError<br/>no attempt used"]
+    PRODUCE -. "error, attempts left" .-> RETRY["retry after 5 s / 10 s"]
+    PRODUCE -. "error, last attempt" .-> FAIL["markVideoFailed"]
+    READY -. "error, last attempt" .-> FAIL
+    UNREC -.-> FAIL
+    FAIL --> MOVED{"did *this* job move<br/>the row to ERROR?"}
+    MOVED -- yes --> CLEAN["deleteVideoOutputs<br/>hls-output/&lt;id&gt;/ + thumbnail"]
+    MOVED -- no --> KEEP["touch nothing<br/>(row is READY or gone)"]
+```
+
+| Decision | Why |
+|---|---|
+| Temp folder per job id, wiped at the start **and** deleted in `finally` | A crashed earlier attempt may have left files; a successful or failed one must not leave 230 MB behind |
+| Progress by phase (10 / 75 / 5 / 10 %) | The transcode is ~85 % of the time, so it gets most of the bar; the bar moves smoothly instead of jumping |
+| `FAIL_RATE` right after the download | A simulated failure still exercises download + cleanup, but doesn't waste an FFmpeg run |
+| Checkpoint: `job.updateData({ output })` after the upload | If only the READY update fails, the retry skips straight to it ([section 9](#what-about-a-step-job-or-a-step-job-with-a-flow)) |
+| READY with paths and duration in **one** `UPDATE … WHERE status = 'PROCESSING'` | One write; a video is never READY without its paths, and never shows half its metadata |
+| Cleanup only if `markVideoFailed` returned a row | A duplicate job for a READY video fails with "Video is READY"; deleting outputs then would destroy a good video |
+| User-facing `error_message` only from `UnrecoverableError` | Those messages are ours. Anything else (a Postgres error carries the full SQL and its parameters) becomes "Processing failed after 3 attempts"; the details stay in the logs and Bull Board |
+| SIGTERM aborts the work and returns the job to `wait` | A transcode outlives any reasonable shutdown timeout; see [queues.md, Graceful shutdown](queues.md#graceful-shutdown) |
+
+#### Tested end to end, in the worker container
+
+| Test | How | Result |
+|---|---|---|
+| **A. Happy path** | Real 4K upload | READY with `hls_path`, `thumbnail_path`, `duration_seconds = 32`; 22 HLS objects; `/tmp/klyro` empty; timings below |
+| **B. SIGTERM mid-transcode** | `docker compose stop worker` at 30 % | Stopped in 2.7 s; job `waiting`, `attemptsMade=0`; video still PROCESSING; no temp files left (`docker diff`); after restart it finished as attempt 1 |
+| **C. Duplicate job for a READY video** | Enqueue again after success | Failed at once with "Video is READY, expected PROCESSING"; `markedError: false`; all 22 objects kept |
+| **D. READY update fails once** | Temporary Postgres trigger, removed afterwards | Attempt 1 uploaded then failed; attempt 2 logged "outputs already uploaded … skipping to READY" and finished in 0.3 s |
+| **E. READY update always fails** | Same trigger | 3 attempts (2 and 3 took 0.3 s each), then ERROR; `deletedOutputs: 22`; HLS prefix and thumbnail gone |
+| **Bad input** | A stuck "upload" that was 1000 random bytes | ERROR after **one** attempt: `ffprobe could not read the file …` |
+
+E is also where the SQL-in-`error_message` problem showed up, which led to the user-facing message rule above.
+
+#### The timing line
+
+Every successful job logs `outputs uploaded` with per-phase timings. For the 4K sample in the container:
+
+| download | probe | transcode | thumbnail | upload | total | source | output |
+|---|---|---|---|---|---|---|---|
+| 1.3–2.7 s | 1.1–1.2 s | 35.0–36.9 s | 1.3–1.6 s | 0.4–0.5 s | ~42 s | 239 MB | 36 MB, 22 files |
+
+That's `secondsPerGb: 178`, about **3 minutes per GB**, for a 4K H.264 source on 8 cores. It's per GB of *this* source; a 1080p source of the same size has more seconds of video, so it decodes faster per second but has more of them. Stage 7 measures more inputs for `NOTES.md`.
 
 **Download speed, for the record:** the 229 MB raw object streamed from RustFS to disk in 1.2–2.5 s. The transcode (46 s for 32 s of 4K) is roughly 20–40× the download, so the download is not worth optimising.
 

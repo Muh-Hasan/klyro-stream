@@ -5,7 +5,7 @@ import { closeQueueConnections, queueConnection } from './lib/queue/connection.j
 import { closeQueues, type TranscodeJob, VIDEO_QUEUE } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
 import { logger } from './utils/logger.js';
-import { processVideo } from './worker/video.processor.js';
+import { processVideo, stopActiveJobs } from './worker/video.processor.js';
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
@@ -30,7 +30,7 @@ const shutdown = async (reason: string, exitCode = 0) => {
     process.exit(1);
   }
   shuttingDown = true;
-  logger.info({ reason }, 'shutting down, waiting for active jobs');
+  logger.info({ reason }, 'shutting down, returning active jobs to the queue');
 
   const forceExit = setTimeout(() => {
     logger.error('graceful shutdown timed out, forcing exit');
@@ -38,8 +38,10 @@ const shutdown = async (reason: string, exitCode = 0) => {
   }, SHUTDOWN_TIMEOUT_MS);
   forceExit.unref();
 
-  await videoWorker.close();
-  logger.info('worker closed, active jobs finished');
+  const closing = videoWorker.close();
+  stopActiveJobs();
+  await closing;
+  logger.info('worker closed');
 
   const results = await Promise.allSettled([
     closeQueues().finally(closeQueueConnections),

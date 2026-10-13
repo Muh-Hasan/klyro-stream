@@ -7,9 +7,16 @@ export const VIDEO_QUEUE = 'video-processing';
 
 const ENQUEUE_TIMEOUT_MS = 2_000;
 
+export type TranscodeOutput = {
+  hlsPath: string;
+  thumbnailPath: string;
+  durationSeconds: number;
+};
+
 export type TranscodeJob = {
   videoId: string;
   requestId?: string;
+  output?: TranscodeOutput;
 };
 
 export const videoQueue = new Queue<TranscodeJob>(VIDEO_QUEUE, {

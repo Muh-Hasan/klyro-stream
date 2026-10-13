@@ -637,6 +637,8 @@ The processor (a Sprint 5 stub; Sprint 6 replaces the middle with FFmpeg):
 
 #### Why a stub, and what the stub steps are
 
+> **Sprint 6 replaced the stub** with the real pipeline (download → probe → FFmpeg → thumbnail → upload). See [transcoding.md, section 10](transcoding.md#10-the-sprint-6-pipeline). The reasoning below still explains why Sprint 5 started with fake work. `FAIL_RATE` now fires right after the download.
+
 Sprint 5 is about the *plumbing*: enqueue, retry, fail, shut down, recover. FFmpeg (Sprint 6) brings its own problems (temp files, child processes, S3 streaming). Building both at once would make every bug ambiguous: is it the queue or the encoder? So the processor's "work" is fake, while everything around it is the real code Sprint 6 keeps.
 
 ```ts
@@ -879,17 +881,29 @@ What scaling out doesn't fix:
 
 ### Graceful shutdown
 
+Sprint 6 changed this. A real transcode runs for minutes, far longer than a 30 s shutdown budget, so the worker no longer waits for the active job. It stops FFmpeg and hands the job back to the queue:
+
 ```mermaid
 flowchart TD
-    SIG["SIGINT / SIGTERM"] --> CLOSE["worker.close()<br/>stop taking jobs, wait for active ones"]
-    CLOSE --> CONN["close queue + connections, Postgres, Redis"]
+    SIG["SIGINT / SIGTERM"] --> CLOSE["worker.close()<br/>stop taking new jobs"]
+    CLOSE --> STOP["stopActiveJobs()<br/>abort signal → FFmpeg killed,<br/>download/upload cancelled"]
+    STOP --> FIN["processor's finally:<br/>temp folder deleted"]
+    FIN --> BACK["job.moveToWait(token)<br/>throw WaitingError"]
+    BACK --> CONN["close queue + connections, Postgres, Redis"]
     CONN --> EXIT0(["exit 0"])
     SIG2["second signal, or 30 s passed"] --> EXIT1(["exit 1 now"])
     EXIT1 --> LOCK["the unfinished job keeps its lock until it expires"]
     LOCK --> STALL["any worker's stalled check moves it back to waiting"]
 ```
 
-Docker's default stop grace period is 10 s. The worker container (Sprint 6) needs a `stop_grace_period` at least as long as the shutdown timeout, or every deploy kills jobs mid-way.
+- **`WaitingError` is not a failure.** BullMQ's `handleFailed` recognises it (like `DelayedError`) and doesn't call `moveToFailed`, so **no attempt is used** and the job doesn't count as stalled.
+- **`moveToWait` puts it straight back** in `wait`, so another worker (or this one after the restart) can take it immediately, instead of after a 30 s lock expiry plus a stalled check.
+- **`close()` is called before `stopActiveJobs()`**, so the worker has stopped fetching before the abort; a job can't be picked up between the two.
+- Measured in the container: `docker compose stop worker` at 30% of a transcode returned in 2.7 s. The job was `waiting`, `attemptsMade=0`, the video still PROCESSING, and no files were left in `/tmp/klyro`. After `docker compose start worker` the job ran again as attempt 1 and reached READY.
+
+The stalled path at the bottom is still the safety net for a crash, `kill -9`, or a shutdown that hangs.
+
+`stop_grace_period: 40s` in Compose stays: Docker's default 10 s would be too short if a stop ever has to wait for an upload to cancel or for Postgres/Redis to close.
 
 ### Bull Board: `/admin/queues`
 
