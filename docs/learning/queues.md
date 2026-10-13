@@ -6,7 +6,7 @@ How KlyroStream moves slow work (transcoding, emails, captions) out of HTTP requ
 
 1. [Fundamentals](#part-1-fundamentals): the problem, queues, BullMQ, workers, how a job is processed, concurrency, limits, durability
 2. [BullMQ vs RabbitMQ vs Kafka](#part-2-bullmq-vs-rabbitmq-vs-kafka)
-3. [KlyroStream's queue setup](#part-3-klyrostreams-queue-setup)
+3. [What KlyroStream built in Sprint 5](#part-3-what-klyrostream-built-in-sprint-5): connections, queue, worker, shutdown, Bull Board, recovery scripts, measurements
 4. [Structuring multi-stage work](#part-4-structuring-multi-stage-work): single job, step job, flow, and why transcode + thumbnail is not a flow
 5. [The plan per sprint](#part-5-the-plan-for-klyrostream), gotchas, further reading
 
@@ -282,7 +282,17 @@ Being able to say *why not* Kafka is a good interview answer. "Kafka is a log fo
 
 ---
 
-# Part 3: KlyroStream's queue setup
+# Part 3: What KlyroStream built in Sprint 5
+
+```
+POST /videos/:id/upload/complete              npm run dev:worker
+  ├─ lock row, UPLOADING → PROCESSING           └─ Worker (WORKER_CONCURRENCY)
+  ├─ commit                                          └─ processVideo(job)
+  └─ enqueueTranscode ──▶ Redis ◀─────────────────────  re-read row, require PROCESSING
+                         (video-processing)             progress → PROCESSING → READY
+/admin/queues (Bull Board) ──▶ reads / controls         last attempt failed → ERROR
+npm run videos:requeue-stuck ──▶ reconciles rows with jobs
+```
 
 ### Connections: `src/lib/queue/connection.ts`
 
@@ -323,14 +333,15 @@ export const videoQueue = new Queue<TranscodeJob>(VIDEO_QUEUE, {
 
 videoQueue.on('error', …); // without a listener, a Redis outage crashes the process
 
-export const enqueueTranscode = (videoId: string, requestId?: string) =>
-  videoQueue.add('transcode', { videoId, requestId }, { jobId: transcodeJobId(videoId) });
+export const enqueueTranscode = async (videoId: string, requestId?: string) =>
+  // add('transcode', { videoId, requestId }, { jobId: `video-${videoId}` }),
+  // raced against a 2 s timeout (see Connections above)
 ```
 
 - **Pointers, not state.** The payload is an id. The worker reads the current row from Postgres, never a snapshot from enqueue time.
 - **Idempotent id.** `video-<uuid>`, so a double `/complete` or a requeue script creates one job. Use `-`, not `:`, because `:` separates Redis key parts. Measured: adding the same id twice stores one job, and the stored `requestId` is the first one. The `Job` returned by the second `add()` shows the data you passed, not the stored data.
 - **The id only blocks while the job exists.** Once `removeOnComplete` evicts it (after 100 newer completions), the same id can be added again and runs again. A "re-process this video" feature should use a new id (e.g. `video-<uuid>-r2`) instead of relying on eviction timing.
-- **Enqueue after commit.** `completeVideoUpload` commits `UPLOADING → PROCESSING` first, then enqueues. Enqueueing inside the transaction could start a worker that reads the row *before* the commit and sees `UPLOADING`. If the enqueue fails after the commit, the video is stuck in PROCESSING with no job, and `scripts/requeue-stuck.ts` (step 8) is the safety net. The fully robust version, writing the job into a Postgres "outbox" table in the same transaction, is the *transactional outbox* pattern; it is out of scope for Phase 1.
+- **Enqueue after commit.** `completeVideoUpload` commits `UPLOADING → PROCESSING` first, then enqueues. Enqueueing inside the transaction could start a worker that reads the row *before* the commit and sees `UPLOADING`. If the enqueue fails after the commit, `/complete` still answers **200 PROCESSING** and logs `failed to enqueue transcode`. Returning an error would be worse: the client would retry, hit `409 UPLOAD_NOT_IN_PROGRESS` (the row is already PROCESSING), and conclude the upload failed when it didn't. The stuck video is repaired by `npm run videos:requeue-stuck` (below). The fully robust version, writing the job into a Postgres "outbox" table in the same transaction, is the *transactional outbox* pattern; it is out of scope for Phase 1.
 
 ### Retries and the state machine
 
@@ -342,6 +353,92 @@ export const enqueueTranscode = (videoId: string, requestId?: string) =>
 | Throws `UnrecoverableError` (no video stream, row not PROCESSING) | `failed` immediately, no retries | `ERROR` (or untouched if it wasn't ours) |
 
 Retrying only helps for failures that can change: network blips, RustFS restarting, a full disk. A corrupt file fails identically three times, so it throws `UnrecoverableError` and fails at once.
+
+### The worker: `src/worker.ts` and `src/worker/video.processor.ts`
+
+`worker.ts` is the second entry point (`npm run dev:worker`, `npm run start:worker`). It creates one `Worker` on `queueConnection('worker')`, logs its events (`ready`, `completed`, `stalled`, `error`; `failed` at debug level), and handles shutdown. It never listens on HTTP.
+
+The processor (a Sprint 5 stub; Sprint 6 replaces the middle with FFmpeg):
+
+1. Re-read the video. Missing, or not `PROCESSING` → `UnrecoverableError` (retrying can't help).
+2. Report progress 20 → 100 (`job.updateProgress`), optionally failing on purpose (`FAIL_RATE`).
+3. `videoService.markVideoReady(id)`: a conditional `PROCESSING → READY`. Zero rows changed → `UnrecoverableError`.
+
+Failure handling lives **in the processor**, not in a `failed` listener:
+
+```ts
+const isFinalAttempt = (job: Job, err: unknown) =>
+  err instanceof UnrecoverableError || job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
+// not final → log "will retry" and rethrow (row stays PROCESSING)
+// final     → markVideoFailed(id, reason) (only moves a PROCESSING row), then rethrow
+```
+
+`attemptsMade` counts *finished* attempts, so it is 0 during the first one. Why not the worker's `failed` event, as the plan's reference code does? A `Worker` emits `failed` only for errors thrown by its own processor (checked in BullMQ's `worker.js`). A job that fails because it stalled too many times reaches neither place. Since neither covers everything, the processor keeps the decision next to its context, and the requeue script handles the rest.
+
+`FAIL_RATE` (0 to 1) makes that share of attempts throw a transient error. The env schema refuses a non-zero value in production.
+
+### Graceful shutdown
+
+```
+SIGINT / SIGTERM → worker.close()              stop taking jobs, wait for active ones
+                 → close queue + connections, Postgres, Redis
+                 → exit 0
+second signal, or 30 s → exit 1 now. The unfinished job keeps its lock until it expires,
+                         then any worker's stalled check moves it back to waiting.
+```
+
+Docker's default stop grace period is 10 s. The worker container (Sprint 6) needs a `stop_grace_period` at least as long as the shutdown timeout, or every deploy kills jobs mid-way.
+
+### Bull Board: `/admin/queues`
+
+- Mounted in the **API** (`src/routes/admin.routes.ts`), and only when `BULL_BOARD_USER` and `BULL_BOARD_PASSWORD` (at least 12 characters) are both set.
+- HTTP basic auth (`basic-auth.middleware.ts`): both sides are SHA-256 hashed, then compared with `timingSafeEqual`, and the user and password are always both checked, so response time leaks nothing.
+- `adminLimiter`: 10 **failed** requests per 15 min per IP (`skipSuccessfulRequests`), because the dashboard itself polls every few seconds. It runs before auth, so a locked-out IP can't keep guessing.
+- Its polling `GET`s are kept out of the request log; actions (retry, clean, promote) are logged.
+- **Retry in Bull Board re-runs the job, not the video.** Retrying the job of an ERROR video fails at once with "Video is ERROR, expected PROCESSING". Bringing a failed video back needs an explicit `ERROR → PROCESSING` decision in the app.
+
+### Recovery scripts: `src/scripts/`
+
+The row is the truth; these reconcile the queue (and storage) with it. The logic is in `services/video-recovery.service.ts`, so a scheduled job could call it later.
+
+`npm run videos:requeue-stuck -- [--dry-run] [--club <id>] [--min-age-minutes 10]`
+
+| Job for a PROCESSING video | Meaning | Action |
+|---|---|---|
+| waiting / active / delayed | healthy | leave it |
+| none | enqueue failed, or Redis lost it | enqueue |
+| completed | finished without marking READY | remove the old job (the same id would block `add`), enqueue |
+| failed | gave up, row never marked (stalled out, DB down) | mark ERROR with the job's reason |
+
+`npm run videos:expire-uploads -- [--dry-run] [--club <id>] [--older-than-hours 24]` aborts the multipart upload of UPLOADING rows older than the cutoff (freeing the stored parts) and marks them ERROR. It takes the same row lock as the uploader's abort and `/complete`, so it can't race them.
+
+Both are safe to run repeatedly, and `--dry-run` changes nothing. Always dry-run first on real data.
+
+### Measured in Sprint 5
+
+| Behaviour | Result |
+|---|---|
+| Enqueue with Redis down (after boot) | `/complete` 200 PROCESSING in 61 ms, error logged |
+| Two `/complete` calls in parallel | one 200, one 409, one job (the row lock serialises them) |
+| `FAIL_RATE=1` | attempts at +0 s, +5 s, +10 s, then ERROR with the reason and 3 stack traces |
+| `FAIL_RATE=0.5`, 8 uploads | 6 READY on the first try, 1 READY on attempt 3, 1 ERROR (expected rate 0.5³ = 12.5%) |
+| Ctrl+C mid-job | job finishes, exit 0 |
+| Double Ctrl+C mid-job | exit 1; the next worker's stalled check recovered the job 30 s later, without using up a retry |
+| `WORKER_CONCURRENCY` 1 vs 3, 3 stub jobs | 7.8 s vs 2.9 s (the stub only waits; FFmpeg won't scale like this) |
+| API booted with Redis down | enqueue times out after 2 s, then works once Redis is up; rate limits resume |
+| Requeue script on 4 real cases | missing → READY, completed → READY, failed → ERROR, waiting → untouched; a second run finds nothing |
+
+### Running it locally
+
+```bash
+docker compose up -d                 # Postgres, Redis, RustFS, Mailpit
+cd backend
+npm run dev                          # terminal 1: API on :4000
+npm run dev:worker                   # terminal 2: worker
+# upload:    npm run upload -- <file> --club <clubId>
+# dashboard: http://localhost:4000/admin/queues  (BULL_BOARD_* in .env)
+# failures:  $env:FAIL_RATE=0.5; npm run dev:worker   (PowerShell)
+```
 
 ---
 
@@ -540,7 +637,7 @@ Chaining vs flow is a common confusion. A flow parent **waits for every child**.
 
 | Sprint | Work | Shape | Why |
 |---|---|---|---|
-| **5** Job queue | Stub processor: re-read row, fake progress, `PROCESSING → READY` | Single job | Nothing expensive yet; learn retries, failure, shutdown first |
+| **5** Job queue ✅ | Stub processor: re-read row, fake progress, `PROCESSING → READY` | Single job | Nothing expensive yet; learn retries, failure, shutdown first. Built, see Part 3 |
 | **6** Transcoding | download → probe → one FFmpeg run (all renditions) → thumbnail → upload → READY | Single job | One download, one decode, FFmpeg writes the master playlist, one machine. Measure first. If the "X minutes per GB" number shows retries re-transcoding hurts, add step checkpoints at the upload boundary |
 | **7** Delete video | Remove a still-waiting job before deleting objects and the row | `videoQueue.getJob(id)` → `remove()` | Removing an `active` job throws (it's locked); the processor's "row must be PROCESSING" check covers that race |
 | **8** Real-time + email | API listens with `QueueEvents`; READY triggers a `send-email` job on a `notifications` queue | Chain | The email must not delay or fail the video. Its own queue gets its own retries (and a higher `concurrency`, since it's I/O) |

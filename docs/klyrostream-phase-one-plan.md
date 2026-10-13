@@ -188,7 +188,7 @@ One sprint at a time, no calendar. A sprint is done when its checklist is ticked
 | S2 Secure sessions | Full session lifecycle plus a reset email in Mailpit | Not started |
 | S3 Google and clubs | Sign in with Google, create a club, invite a member | Not started |
 | S4 Uploads | Upload a 1 GB file, kill it mid-way, resume it | Not started |
-| S5 Job queue | Jobs flow and retry in Bull Board | Not started |
+| S5 Job queue | Jobs flow and retry in Bull Board | Done (GIF pending) |
 | S6 Transcoding | Raw video in, playable HLS out | Not started |
 | S7 Library and playback | Search, stream and download through the API | Not started |
 | S8 Real-time and email | Upload in one client, live "ready" event in another | Not started |
@@ -791,12 +791,13 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 ```
 
-- [ ] API and worker run as two separate processes from one codebase
-- [ ] Duplicate completions do not create duplicate jobs
-- [ ] Retries back off; final failure marks the video ERROR with a reason
-- [ ] Worker shuts down without dropping a running job
-- [ ] Bull Board is password-protected
-- [ ] ADR written: why a queue and a separate worker instead of processing in the request
+- [x] API and worker run as two separate processes from one codebase
+- [x] Duplicate completions do not create duplicate jobs
+- [x] Retries back off; final failure marks the video ERROR with a reason
+- [x] Worker shuts down without dropping a running job
+- [x] Bull Board is password-protected
+- [x] Stuck PROCESSING videos and abandoned uploads can be repaired (`videos:requeue-stuck`, `videos:expire-uploads`)
+- ~~ADR written: why a queue and a separate worker~~ (dropped; the reasoning lives in [learning/queues.md](learning/queues.md))
 - [ ] GIF of jobs flowing and retrying in the README
 
 ## Sprint 6 — Transcoding worker

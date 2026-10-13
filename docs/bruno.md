@@ -78,3 +78,14 @@ npx @usebruno/cli run videos --env local --sandbox developer --env-var accessTok
 With the 228 MB sample: 34 requests (29 of them "Upload part"), 66/66 assertions, about 2.5 s locally.
 
 For parallel parts and resume after a kill, use the CLI: `npm run upload -- <file> --club <clubId>` in `backend/`. See [learning/uploads.md](learning/uploads.md) and [learning/uploads-lab.md](learning/uploads-lab.md).
+
+## Job dashboard (admin)
+
+`admin/Queue counts` calls the JSON API behind Bull Board (`/admin/queues/api/queues`) with HTTP basic auth and asserts the `video-processing` queue is there. It reads two **secret** environment variables, `bullBoardUser` and `bullBoardPassword`. Set them in **Environments → local** to the `BULL_BOARD_USER` / `BULL_BOARD_PASSWORD` values from `backend/.env`; Bruno keeps secret values out of the `.bru` file.
+
+```bash
+cd bruno
+npx @usebruno/cli run admin --env local --env-var bullBoardUser=admin --env-var bullBoardPassword=<password>
+```
+
+The dashboard itself is at http://localhost:4000/admin/queues in a browser. See [learning/queues.md](learning/queues.md).

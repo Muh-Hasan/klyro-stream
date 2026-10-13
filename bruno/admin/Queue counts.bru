@@ -1,0 +1,25 @@
+meta {
+  name: Queue counts
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/admin/queues/api/queues
+  body: none
+  auth: basic
+}
+
+auth:basic {
+  username: {{bullBoardUser}}
+  password: {{bullBoardPassword}}
+}
+
+assert {
+  res.status: eq 200
+  res.body.queues[0].name: eq video-processing
+}
+
+docs {
+  The JSON behind the Bull Board dashboard: job counts per state for each queue. Uses the BULL_BOARD_USER / BULL_BOARD_PASSWORD from backend/.env, set as secret environment variables.
+}
