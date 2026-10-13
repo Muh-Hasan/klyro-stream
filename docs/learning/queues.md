@@ -97,7 +97,7 @@ backend/src/
 ```ts
 // src/worker.ts (Sprint 5, step 4), roughly
 const worker = new Worker<TranscodeJob>(VIDEO_QUEUE, processVideo, {
-  connection: workerConnection,
+  connection: queueConnection('worker'),
   concurrency: env.WORKER_CONCURRENCY,
 });
 // …plus graceful shutdown on SIGTERM
@@ -296,11 +296,23 @@ BullMQ gets its own Redis connections, separate from the cache/rate-limit client
 
 `closeQueueConnections()` uses `quit()` on connections that are `ready` and `disconnect()` on the rest. `quit()` *sends a command*, which fails when Redis is already down, and shutdown has to work exactly then.
 
+Each connection is created on first use (`queueConnection('producer' | 'worker')`), so the API never opens a worker connection. They are deliberately **not** `lazyConnect`. A `Queue` or `Worker` runs its setup once, in its constructor, and caches the result. With a lazy connection and Redis down at boot, that setup fails and the queue stays broken **even after Redis returns**. With an eager connection, setup waits for Redis instead. So `enqueueTranscode` puts a 2-second limit on `add()`: a request during that "Redis has never been up" window fails quickly. The job is still created once Redis arrives, which is harmless because the jobId is idempotent.
+
+Measured, API booted with Redis down:
+
+| | lazyConnect (before) | eager + 2 s limit (now) |
+|---|---|---|
+| Enqueue while Redis has never been up | rejects in 1 ms | rejects after 2 s |
+| Enqueue after Redis comes back | **"Connection is closed" forever** | works |
+| Enqueue after Redis drops later | rejects in 1 ms | rejects in 1 ms |
+
+The same trap exists in `rate-limit-redis`: it loads its Lua scripts once at boot and caches the promise. With `passOnStoreError: true`, a failed load meant **every rate limit silently turned off** until a restart. `RecoveringRedisStore` in `rate-limit.middleware.ts` reloads a failed script, so limiting resumes once Redis is back. The lesson is general: **anything that does one-time setup against a dependency must handle that dependency being down at boot.**
+
 ### The queue: `src/lib/queue/queues.ts`
 
 ```ts
 export const videoQueue = new Queue<TranscodeJob>(VIDEO_QUEUE, {
-  connection: producerConnection,
+  connection: queueConnection('producer'),
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: 'exponential', delay: 5_000 }, // retry after 5 s, then 10 s
@@ -408,7 +420,7 @@ So in practice the checkpoints sit at "outputs uploaded" boundaries, not after e
 A flow is a **tree of jobs** added atomically by a `FlowProducer`. Children run first, possibly in parallel on different workers and in different queues. The parent sits in `waiting-children` and runs only when they have all finished, and it can read their return values.
 
 ```ts
-const flows = new FlowProducer({ connection: producerConnection });
+const flows = new FlowProducer({ connection: queueConnection('producer') });
 
 await flows.add({
   name: 'finalize',

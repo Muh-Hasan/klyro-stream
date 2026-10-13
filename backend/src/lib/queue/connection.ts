@@ -4,9 +4,10 @@ import { logger } from '../../utils/logger.js';
 
 type Role = 'producer' | 'worker';
 
+const connections = new Map<Role, Redis>();
+
 const createConnection = (role: Role) => {
   const connection = new Redis(env.REDIS_URL, {
-    lazyConnect: true,
     maxRetriesPerRequest: null,
     enableOfflineQueue: role === 'worker',
     connectionName: `klyro:${role}`,
@@ -15,13 +16,17 @@ const createConnection = (role: Role) => {
   return connection;
 };
 
-export const producerConnection = createConnection('producer');
-export const workerConnection = createConnection('worker');
+export const queueConnection = (role: Role) => {
+  let connection = connections.get(role);
+  if (!connection) {
+    connection = createConnection(role);
+    connections.set(role, connection);
+  }
+  return connection;
+};
 
 export const closeQueueConnections = async () => {
-  const open = [producerConnection, workerConnection].filter(
-    (connection) => connection.status !== 'wait' && connection.status !== 'end',
-  );
+  const open = [...connections.values()].filter((connection) => connection.status !== 'end');
   for (const connection of open) if (connection.status !== 'ready') connection.disconnect();
   await Promise.all(open.filter((c) => c.status === 'ready').map((c) => c.quit()));
 };

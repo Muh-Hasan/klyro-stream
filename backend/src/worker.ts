@@ -1,7 +1,7 @@
 import { Worker } from 'bullmq';
 import { env } from './config/env.js';
 import { closeDb } from './lib/db/client.js';
-import { closeQueueConnections, workerConnection } from './lib/queue/connection.js';
+import { closeQueueConnections, queueConnection } from './lib/queue/connection.js';
 import { closeQueues, type TranscodeJob, VIDEO_QUEUE } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
 import { logger } from './utils/logger.js';
@@ -10,7 +10,7 @@ import { processVideo } from './worker/video.processor.js';
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
 const videoWorker = new Worker<TranscodeJob>(VIDEO_QUEUE, processVideo, {
-  connection: workerConnection,
+  connection: queueConnection('worker'),
   concurrency: env.WORKER_CONCURRENCY,
 });
 

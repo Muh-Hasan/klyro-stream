@@ -1,8 +1,11 @@
+import { setTimeout as sleep } from 'node:timers/promises';
 import { Queue } from 'bullmq';
 import { logger } from '../../utils/logger.js';
-import { producerConnection } from './connection.js';
+import { queueConnection } from './connection.js';
 
 export const VIDEO_QUEUE = 'video-processing';
+
+const ENQUEUE_TIMEOUT_MS = 2_000;
 
 export type TranscodeJob = {
   videoId: string;
@@ -10,7 +13,7 @@ export type TranscodeJob = {
 };
 
 export const videoQueue = new Queue<TranscodeJob>(VIDEO_QUEUE, {
-  connection: producerConnection,
+  connection: queueConnection('producer'),
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: 'exponential', delay: 5_000 },
@@ -23,8 +26,19 @@ videoQueue.on('error', (err) => logger.error({ err, queue: VIDEO_QUEUE }, 'queue
 
 export const transcodeJobId = (videoId: string) => `video-${videoId}`;
 
-export const enqueueTranscode = (videoId: string, requestId?: string) =>
-  videoQueue.add('transcode', { videoId, requestId }, { jobId: transcodeJobId(videoId) });
+export const enqueueTranscode = async (videoId: string, requestId?: string) => {
+  const timeout = new AbortController();
+  try {
+    return await Promise.race([
+      videoQueue.add('transcode', { videoId, requestId }, { jobId: transcodeJobId(videoId) }),
+      sleep(ENQUEUE_TIMEOUT_MS, undefined, { signal: timeout.signal }).then(() => {
+        throw new Error(`Enqueue timed out after ${ENQUEUE_TIMEOUT_MS} ms`);
+      }),
+    ]);
+  } finally {
+    timeout.abort();
+  }
+};
 
 export const closeQueues = async () => {
   await videoQueue.close();

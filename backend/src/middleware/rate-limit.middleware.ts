@@ -5,6 +5,30 @@ import { TooManyRequestsError } from '../utils/errors.js';
 
 const MINUTE = 60 * 1000;
 
+const failed = (promise: Promise<unknown>) =>
+  promise.then(
+    () => false,
+    () => true,
+  );
+const quiet = <T>(promise: Promise<T>) => {
+  promise.catch(() => undefined);
+  return promise;
+};
+
+class RecoveringRedisStore extends RedisStore {
+  override async increment(key: string) {
+    try {
+      return await super.increment(key);
+    } catch (err) {
+      if (await failed(this.incrementScriptSha)) {
+        this.incrementScriptSha = quiet(this.loadIncrementScript());
+      }
+      if (await failed(this.getScriptSha)) this.getScriptSha = quiet(this.loadGetScript());
+      throw err;
+    }
+  }
+}
+
 const limiter = (name: string, limit: number, windowMs: number) =>
   rateLimit({
     windowMs,
@@ -12,7 +36,7 @@ const limiter = (name: string, limit: number, windowMs: number) =>
     standardHeaders: 'draft-8',
     legacyHeaders: false,
     passOnStoreError: true,
-    store: new RedisStore({
+    store: new RecoveringRedisStore({
       prefix: `rl:${name}:`,
       sendCommand: (command: string, ...args: string[]) =>
         redis.call(command, ...args) as Promise<RedisReply>,
