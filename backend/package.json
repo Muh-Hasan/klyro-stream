@@ -24,7 +24,8 @@
     "storage:init": "tsx src/scripts/storage-init.ts",
     "upload": "tsx src/scripts/upload.ts",
     "videos:requeue-stuck": "tsx src/scripts/requeue-stuck.ts",
-    "videos:expire-uploads": "tsx src/scripts/expire-uploads.ts"
+    "videos:expire-uploads": "tsx src/scripts/expire-uploads.ts",
+    "videos:play": "tsx src/scripts/hls-player.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1146.0",

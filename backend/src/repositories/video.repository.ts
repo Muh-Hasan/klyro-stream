@@ -1,4 +1,4 @@
-import { and, asc, eq, lt } from 'drizzle-orm';
+import { and, asc, desc, eq, lt } from 'drizzle-orm';
 import { db, type Tx } from '../lib/db/client.js';
 import { type Video, type NewVideo, type VideoStatus, videos } from '../lib/db/schema.js';
 
@@ -35,6 +35,13 @@ export const create = async (data: NewVideo): Promise<Video> => {
 
 export const findById = (id: string): Promise<Video | undefined> =>
   db.query.videos.findFirst({ where: eq(videos.id, id) });
+
+export const findByStatus = (status: VideoStatus, limit: number): Promise<Video[]> =>
+  db.query.videos.findMany({
+    where: eq(videos.status, status),
+    orderBy: desc(videos.updatedAt),
+    limit,
+  });
 
 export const findProcessingSince = (
   before: Date,

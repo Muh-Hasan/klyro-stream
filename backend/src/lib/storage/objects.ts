@@ -75,3 +75,12 @@ export const deletePrefix = async (bucket: string, prefix: string): Promise<numb
   } while (token);
   return deleted;
 };
+
+export const openObject = async (bucket: string, key: string, signal?: AbortSignal) => {
+  const { Body, ContentType, ContentLength } = await s3.send(
+    new GetObjectCommand({ Bucket: bucket, Key: key }),
+    { abortSignal: signal },
+  );
+  if (!(Body instanceof Readable)) throw new Error(`GetObject ${key} returned no stream`);
+  return { body: Body, contentType: ContentType, contentLength: ContentLength };
+};
