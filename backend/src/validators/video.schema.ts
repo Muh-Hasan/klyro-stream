@@ -1,5 +1,7 @@
 import { z } from 'zod';
+import { videoStatusEnum } from '../lib/db/schema.js';
 import { clubParams } from './club.schema.js';
+import { paginationQuery } from './common.schema.js';
 
 export const VIDEO_TYPES = {
   'video/mp4': 'mp4',
@@ -95,6 +97,26 @@ export const abortUploadSchemas = {
   params: videoParams,
 };
 
+export const MAX_SEARCH_LENGTH = 100;
+
+export const listVideosSchemas = {
+  params: clubParams,
+  query: paginationQuery.extend({
+    status: z
+      .enum(videoStatusEnum.enumValues, {
+        error: `The status must be one of: ${videoStatusEnum.enumValues.join(', ')}.`,
+      })
+      .optional(),
+    q: z
+      .string()
+      .trim()
+      .max(MAX_SEARCH_LENGTH, `The search must be at most ${MAX_SEARCH_LENGTH} characters.`)
+      .optional()
+      .transform((q) => q || undefined),
+  }),
+};
+
+export type ListVideosInput = z.output<typeof listVideosSchemas.query>;
 export type InitiateUploadInput = z.output<typeof initiateUploadSchemas.body>;
 export type PresignPartsInput = z.output<typeof presignPartsSchemas.body>;
 export type CompleteUploadInput = z.output<typeof completeUploadSchemas.body>;

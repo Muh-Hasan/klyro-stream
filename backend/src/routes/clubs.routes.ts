@@ -23,7 +23,7 @@ import {
   removeMemberSchemas,
   updateMemberSchemas,
 } from '../validators/member.schema.js';
-import { initiateUploadSchemas } from '../validators/video.schema.js';
+import { initiateUploadSchemas, listVideosSchemas } from '../validators/video.schema.js';
 
 export const clubsRouter = Router();
 
@@ -88,6 +88,12 @@ clubsRouter.post(
   memberController.leave,
 );
 
+clubsRouter.get(
+  '/:clubId/videos',
+  validate(listVideosSchemas),
+  requireClubRole('viewer'),
+  videoController.list,
+);
 clubsRouter.post(
   '/:clubId/videos/uploads',
   validate(initiateUploadSchemas),

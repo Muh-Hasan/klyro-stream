@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, lt } from 'drizzle-orm';
+import { and, asc, count, desc, eq, ilike, inArray, lt } from 'drizzle-orm';
 import { db, type Tx } from '../lib/db/client.js';
 import { type Video, type NewVideo, type VideoStatus, videos } from '../lib/db/schema.js';
 
@@ -35,6 +35,46 @@ export const create = async (data: NewVideo): Promise<Video> => {
 
 export const findById = (id: string): Promise<Video | undefined> =>
   db.query.videos.findFirst({ where: eq(videos.id, id) });
+
+export type VideoListFilter = {
+  clubId: string;
+  statuses: readonly VideoStatus[];
+  search?: string;
+};
+
+const escapeLike = (text: string) => text.replace(/[\\%_]/g, '\\$&');
+
+export const listForClub = async (
+  { clubId, statuses, search }: VideoListFilter,
+  limit: number,
+  offset: number,
+) => {
+  const where = and(
+    eq(videos.clubId, clubId),
+    inArray(videos.status, [...statuses]),
+    search ? ilike(videos.title, `%${escapeLike(search)}%`) : undefined,
+  );
+  const [items, [total]] = await Promise.all([
+    db.query.videos.findMany({
+      columns: {
+        id: true,
+        title: true,
+        status: true,
+        thumbnailPath: true,
+        durationSeconds: true,
+        sizeBytes: true,
+        uploadedBy: true,
+        createdAt: true,
+      },
+      where,
+      orderBy: [desc(videos.createdAt), desc(videos.id)],
+      limit,
+      offset,
+    }),
+    db.select({ value: count() }).from(videos).where(where),
+  ]);
+  return { items, total: total?.value ?? 0 };
+};
 
 export const findByStatus = (status: VideoStatus, limit: number): Promise<Video[]> =>
   db.query.videos.findMany({

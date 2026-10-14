@@ -1,0 +1,49 @@
+meta {
+  name: List club videos
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/clubs/{{clubId}}/videos?page=1&limit=20
+  body: none
+  auth: bearer
+}
+
+params:query {
+  page: 1
+  limit: 20
+  ~status: READY
+  ~q: demo
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+docs {
+  Newest first. `status` filters by UPLOADING, PROCESSING, READY or ERROR; viewers only ever see READY. `q` is a case-insensitive title search where `%` and `_` are literal. `limit` is capped at 50.
+
+  Example response:
+
+  ```json
+  {
+    "items": [
+      {
+        "id": "4dce8038-4c87-4472-99e6-635ad14a2216",
+        "title": "Two-minute demo (1080p)",
+        "status": "READY",
+        "durationSeconds": 120,
+        "sizeBytes": 297873717,
+        "uploadedBy": "a5a3efa3-d269-41bf-b6da-187084ab047a",
+        "createdAt": "2026-10-13T16:15:38.770Z",
+        "thumbnailUrl": "http://localhost:9000/thumbnails/4dce8038-4c87-4472-99e6-635ad14a2216.jpg?X-Amz-...&X-Amz-Expires=600&X-Amz-Signature=..."
+      }
+    ],
+    "page": 1,
+    "limit": 20,
+    "total": 32,
+    "totalPages": 2
+  }
+  ```
+}

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ClubRole } from '../lib/db/schema.js';
+import { type ClubRole, type VideoStatus, videoStatusEnum } from '../lib/db/schema.js';
 import { enqueueTranscode, type TranscodeOutput } from '../lib/queue/queues.js';
 import { BUCKETS } from '../lib/storage/client.js';
 import {
@@ -14,20 +14,52 @@ import {
   startUpload,
   storageErrorName,
 } from '../lib/storage/multipart.js';
-import { deleteObject, deletePrefix } from '../lib/storage/objects.js';
+import { deleteObject, deletePrefix, presignGet } from '../lib/storage/objects.js';
 import * as clubRepo from '../repositories/club.repository.js';
 import * as videoRepo from '../repositories/video.repository.js';
 import type { Membership } from '../types/express.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
+import { paginated, toOffset } from '../utils/pagination.js';
 import {
   type CompleteUploadInput,
   type InitiateUploadInput,
+  type ListVideosInput,
   type PresignPartsInput,
   VIDEO_TYPES,
 } from '../validators/video.schema.js';
 
 const UPLOADER_ROLES: readonly ClubRole[] = ['club_owner', 'admin'];
+
+export const THUMBNAIL_URL_TTL_SECONDS = 600;
+
+const thumbnailUrl = (key: string | null) =>
+  key ? presignGet(BUCKETS.thumbnails, key, THUMBNAIL_URL_TTL_SECONDS) : null;
+
+const visibleStatuses = (role: ClubRole): readonly VideoStatus[] =>
+  UPLOADER_ROLES.includes(role) ? videoStatusEnum.enumValues : ['READY'];
+
+export const listVideos = async (
+  { clubId, role }: Membership,
+  { page, limit, status, q }: ListVideosInput,
+) => {
+  const visible = visibleStatuses(role);
+  const statuses = status ? visible.filter((s) => s === status) : visible;
+  if (statuses.length === 0) return paginated([], 0, page, limit);
+
+  const { items, total } = await videoRepo.listForClub(
+    { clubId, statuses, search: q },
+    limit,
+    toOffset(page, limit),
+  );
+  const withThumbnails = await Promise.all(
+    items.map(async ({ thumbnailPath, ...video }) => ({
+      ...video,
+      thumbnailUrl: await thumbnailUrl(thumbnailPath),
+    })),
+  );
+  return paginated(withThumbnails, total, page, limit);
+};
 
 const rawKey = (clubId: string, videoId: string, ext: string) =>
   `clubs/${clubId}/videos/${videoId}/original.${ext}`;

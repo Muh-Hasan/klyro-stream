@@ -7,9 +7,16 @@ import type {
   abortUploadSchemas,
   completeUploadSchemas,
   initiateUploadSchemas,
+  listVideosSchemas,
   presignPartsSchemas,
   uploadProgressSchemas,
 } from '../validators/video.schema.js';
+
+export const list: RequestHandler = async (_req, res) => {
+  const { query } = getInput<typeof listVideosSchemas>(res);
+  const result = await videoService.listVideos(currentMembership(res), query);
+  res.json(result);
+};
 
 export const initiateUpload: RequestHandler = async (req, res) => {
   const { body } = getInput<typeof initiateUploadSchemas>(res);

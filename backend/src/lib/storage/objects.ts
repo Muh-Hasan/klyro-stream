@@ -9,7 +9,8 @@ import {
   ListObjectsV2Command,
   PutObjectCommand,
 } from '@aws-sdk/client-s3';
-import { s3 } from './client.js';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { s3, s3Public } from './client.js';
 
 export const downloadObject = async (
   bucket: string,
@@ -84,3 +85,6 @@ export const openObject = async (bucket: string, key: string, signal?: AbortSign
   if (!(Body instanceof Readable)) throw new Error(`GetObject ${key} returned no stream`);
   return { body: Body, contentType: ContentType, contentLength: ContentLength };
 };
+
+export const presignGet = (bucket: string, key: string, expiresIn: number): Promise<string> =>
+  getSignedUrl(s3Public, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn });
