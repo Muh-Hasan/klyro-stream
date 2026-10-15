@@ -34,7 +34,11 @@ export const validate =
       if (!schema) continue;
       const result = schema.safeParse(req[part] ?? {});
       if (result.success) valid[part] = result.data;
-      else issues[part] = z.flattenError(result.error).fieldErrors;
+      else {
+        const { formErrors, fieldErrors } = z.flattenError(result.error);
+        issues[part] =
+          formErrors.length > 0 ? { _errors: formErrors, ...fieldErrors } : fieldErrors;
+      }
     }
 
     if (Object.keys(issues).length > 0) return next(new ValidationError(issues));
