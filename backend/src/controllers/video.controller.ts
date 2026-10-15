@@ -6,15 +6,29 @@ import { currentUser } from '../utils/current-user.js';
 import type {
   abortUploadSchemas,
   completeUploadSchemas,
+  getVideoSchemas,
   initiateUploadSchemas,
   listVideosSchemas,
   presignPartsSchemas,
+  updateVideoSchemas,
   uploadProgressSchemas,
 } from '../validators/video.schema.js';
 
 export const list: RequestHandler = async (_req, res) => {
   const { query } = getInput<typeof listVideosSchemas>(res);
   const result = await videoService.listVideos(currentMembership(res), query);
+  res.json(result);
+};
+
+export const get: RequestHandler = async (req, res) => {
+  const { params } = getInput<typeof getVideoSchemas>(res);
+  const result = await videoService.getVideo(params.videoId, currentUser(req).id);
+  res.json(result);
+};
+
+export const update: RequestHandler = async (req, res) => {
+  const { params, body } = getInput<typeof updateVideoSchemas>(res);
+  const result = await videoService.updateVideo(params.videoId, currentUser(req).id, body);
   res.json(result);
 };
 

@@ -17,14 +17,16 @@ import {
 import { deleteObject, deletePrefix, presignGet } from '../lib/storage/objects.js';
 import * as clubRepo from '../repositories/club.repository.js';
 import * as videoRepo from '../repositories/video.repository.js';
+import type { Video } from '../repositories/video.repository.js';
 import type { Membership } from '../types/express.js';
-import { BadRequestError, ConflictError, NotFoundError } from '../utils/errors.js';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { paginated, toOffset } from '../utils/pagination.js';
 import {
   type CompleteUploadInput,
   type InitiateUploadInput,
   type ListVideosInput,
+  type UpdateVideoInput,
   type PresignPartsInput,
   VIDEO_TYPES,
 } from '../validators/video.schema.js';
@@ -59,6 +61,56 @@ export const listVideos = async (
     })),
   );
   return paginated(withThumbnails, total, page, limit);
+};
+
+const videoNotFound = () => new NotFoundError('Video not found', 'VIDEO_NOT_FOUND');
+
+const requireVisible = async <T extends Pick<Video, 'clubId' | 'status'>>(
+  video: T | undefined,
+  userId: string,
+) => {
+  if (!video) throw videoNotFound();
+  const role = await clubRepo.getMemberRole(video.clubId, userId);
+  if (!role || !visibleStatuses(role).includes(video.status)) throw videoNotFound();
+  return { video, role };
+};
+
+const canManage = (video: Pick<Video, 'uploadedBy'>, role: ClubRole, userId: string) =>
+  role === 'admin' || (video.uploadedBy === userId && UPLOADER_ROLES.includes(role));
+
+type VideoWithUploader = Video & { uploader: { id: string; email: string } };
+
+const toVideoResponse = async (video: VideoWithUploader) => ({
+  video: {
+    id: video.id,
+    clubId: video.clubId,
+    title: video.title,
+    description: video.description,
+    status: video.status,
+    durationSeconds: video.durationSeconds,
+    sizeBytes: video.sizeBytes,
+    errorMessage: video.errorMessage,
+    uploader: video.uploader,
+    thumbnailUrl: await thumbnailUrl(video.thumbnailPath),
+    createdAt: video.createdAt,
+    updatedAt: video.updatedAt,
+  },
+});
+
+export const getVideo = async (videoId: string, userId: string) => {
+  const { video } = await requireVisible(await videoRepo.findWithUploader(videoId), userId);
+  return toVideoResponse(video);
+};
+
+export const updateVideo = async (videoId: string, userId: string, input: UpdateVideoInput) => {
+  const { video, role } = await requireVisible(await videoRepo.findWithUploader(videoId), userId);
+  if (!canManage(video, role, userId)) {
+    throw new ForbiddenError('You do not have permission to edit this video');
+  }
+
+  const updated = await videoRepo.updateDetails(videoId, input);
+  if (!updated) throw videoNotFound();
+  return toVideoResponse({ ...updated, uploader: video.uploader });
 };
 
 const rawKey = (clubId: string, videoId: string, ext: string) =>

@@ -1,0 +1,40 @@
+meta {
+  name: Get video
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/videos/{{videoId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+docs {
+  Any member of the video's club. Viewers only see READY videos; anything else, and videos in clubs you are not in, return 404 `VIDEO_NOT_FOUND`. `thumbnailUrl` is valid for 10 minutes and is `null` until the video is READY.
+
+  Example response:
+
+  ```json
+  {
+    "video": {
+      "id": "4dce8038-4c87-4472-99e6-635ad14a2216",
+      "clubId": "42c0a5d2-1466-4780-934b-a7800e564f1b",
+      "title": "Two-minute demo (1080p)",
+      "description": null,
+      "status": "READY",
+      "durationSeconds": 120,
+      "sizeBytes": 297873717,
+      "errorMessage": null,
+      "uploader": { "id": "a5a3efa3-d269-41bf-b6da-187084ab047a", "email": "uploader@example.com" },
+      "thumbnailUrl": "http://localhost:9000/thumbnails/4dce8038-4c87-4472-99e6-635ad14a2216.jpg?X-Amz-...&X-Amz-Expires=600&X-Amz-Signature=...",
+      "createdAt": "2026-10-13T16:15:38.770Z",
+      "updatedAt": "2026-10-13T16:17:54.324Z"
+    }
+  }
+  ```
+}

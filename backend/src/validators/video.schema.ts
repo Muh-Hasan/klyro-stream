@@ -15,19 +15,22 @@ export const MAX_VIDEO_BYTES = 5 * 1024 ** 3;
 
 const contentTypes = Object.keys(VIDEO_TYPES) as [VideoContentType, ...VideoContentType[]];
 
+const title = z
+  .string({ error: 'The title is required.' })
+  .trim()
+  .min(1, 'The title is required.')
+  .max(255, 'The title must be at most 255 characters.');
+
+const description = z
+  .string({ error: 'The description must be a string.' })
+  .trim()
+  .max(5000, 'The description must be at most 5000 characters.');
+
 export const initiateUploadSchemas = {
   params: clubParams,
   body: z.object({
-    title: z
-      .string({ error: 'The title is required.' })
-      .trim()
-      .min(1, 'The title is required.')
-      .max(255, 'The title must be at most 255 characters.'),
-    description: z
-      .string()
-      .trim()
-      .max(5000, 'The description must be at most 5000 characters.')
-      .optional(),
+    title,
+    description: description.optional(),
     contentType: z.enum(contentTypes, {
       error: `The file must be one of: ${contentTypes.join(', ')}.`,
     }),
@@ -116,6 +119,26 @@ export const listVideosSchemas = {
   }),
 };
 
+export const getVideoSchemas = {
+  params: videoParams,
+};
+
+export const updateVideoSchemas = {
+  params: videoParams,
+  body: z
+    .object({
+      title: title.optional(),
+      description: description
+        .nullable()
+        .optional()
+        .transform((d) => (d === '' ? null : d)),
+    })
+    .refine((body) => body.title !== undefined || body.description !== undefined, {
+      error: 'Send a title, a description, or both.',
+    }),
+};
+
+export type UpdateVideoInput = z.output<typeof updateVideoSchemas.body>;
 export type ListVideosInput = z.output<typeof listVideosSchemas.query>;
 export type InitiateUploadInput = z.output<typeof initiateUploadSchemas.body>;
 export type PresignPartsInput = z.output<typeof presignPartsSchemas.body>;

@@ -76,6 +76,19 @@ export const listForClub = async (
   return { items, total: total?.value ?? 0 };
 };
 
+export const findWithUploader = (id: string) =>
+  db.query.videos.findFirst({
+    where: eq(videos.id, id),
+    with: { uploader: { columns: { id: true, email: true } } },
+  });
+
+export type VideoDetails = Partial<Pick<NewVideo, 'title' | 'description'>>;
+
+export const updateDetails = async (id: string, details: VideoDetails) => {
+  const [video] = await db.update(videos).set(details).where(eq(videos.id, id)).returning();
+  return video;
+};
+
 export const findByStatus = (status: VideoStatus, limit: number): Promise<Video[]> =>
   db.query.videos.findMany({
     where: eq(videos.status, status),

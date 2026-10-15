@@ -1,0 +1,30 @@
+meta {
+  name: Update video
+  type: http
+  seq: 9
+}
+
+patch {
+  url: {{baseUrl}}/videos/{{videoId}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:json {
+  {
+    "title": "Two-minute demo (1080p)",
+    "description": "Shot on a phone"
+  }
+}
+
+docs {
+  The uploader (while still a club owner or admin) or any club admin. Send `title`, `description`, or both. `"description": null` or `""` clears it; leaving a field out keeps it. Other fields are ignored.
+
+  Errors: 403 `FORBIDDEN` for other members, 404 `VIDEO_NOT_FOUND` if you cannot see the video, 400 `VALIDATION_ERROR` with `details.body._errors` for an empty body.
+
+  Example response: the same shape as Get video.
+}
