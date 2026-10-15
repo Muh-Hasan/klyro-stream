@@ -12,8 +12,9 @@ Related: [indexes.md](indexes.md) (how B-tree indexes work) · [transactions.md]
 4. [Reading the query plans](#4-reading-the-query-plans)
 5. [Presigned GET URLs](#5-presigned-get-urls)
 6. [Stage 1 code: the list endpoint](#6-stage-1-code-the-list-endpoint)
+7. [Stages 2–3: one video, viewing and editing](#7-stages-23-one-video-viewing-and-editing)
 
-Coming in later stages: video detail, edit and delete, signed HLS streaming, atomic download quotas.
+Coming in later stages: delete, signed HLS streaming, atomic download quotas.
 
 ---
 
@@ -310,3 +311,134 @@ The storage key (`thumbnailPath`) is taken out and replaced by a URL. Clients ne
 | `?q=` | same as no search |
 | `?limit=51`, `?status=DONE` | 400 `VALIDATION_ERROR` with the field message |
 | as a viewer | 27, all READY; `?status=ERROR` → 0 |
+
+---
+
+## 7. Stages 2–3: one video, viewing and editing
+
+```text
+GET   /videos/:videoId   → { video: { id, clubId, title, description, status, durationSeconds, sizeBytes,
+                                      errorMessage, uploader: { id, email }, thumbnailUrl, createdAt, updatedAt } }
+PATCH /videos/:videoId   { title?, description? } → same shape
+```
+
+### The authorization problem: the URL has no club in it
+
+The list route is `/clubs/:clubId/videos`, so the `requireClubRole` middleware reads `clubId` from the URL and checks membership before the controller runs. `/videos/:videoId` has no `clubId`. The club is only known **after loading the video**.
+
+The classic bug here is called **IDOR** (insecure direct object reference). The API checks that you're logged in, loads whatever id you asked for, and returns it. Anyone could then read any club's video by copying an id. UUIDs are hard to guess, but ids leak through links, logs and screenshots. Being hard to guess is not access control.
+
+So every `/videos/:id` handler runs the same guard first:
+
+```ts
+const requireVisible = async <T extends Pick<Video, 'clubId' | 'status'>>(video: T | undefined, userId: string) => {
+  if (!video) throw videoNotFound();
+  const role = await clubRepo.getMemberRole(video.clubId, userId);
+  if (!role || !visibleStatuses(role).includes(video.status)) throw videoNotFound();
+  return { video, role };
+};
+```
+
+```mermaid
+flowchart TD
+    R["GET or PATCH /videos/:id"] --> L["load the video row"]
+    L --> E{"row exists?"}
+    E -- no --> N404["404 VIDEO_NOT_FOUND"]
+    E -- yes --> M{"member of video.clubId?"}
+    M -- no --> N404
+    M -- yes --> V{"status visible to this role?<br/>(viewer: READY only)"}
+    V -- no --> N404
+    V -- yes --> G{"GET?"}
+    G -- yes --> OK["200 with the video"]
+    G -- "no, PATCH" --> C{"club admin, or the uploader<br/>who is still owner or admin?"}
+    C -- no --> F403["403 FORBIDDEN"]
+    C -- yes --> U["UPDATE title / description"] --> OK
+```
+
+- **One guard, reused.** Delete, stream and download (Stages 4–6) start with the same `requireVisible`, so the rule lives in one place.
+- **It's generic over the row type** (`<T extends Pick<...>>`). It accepts a plain `Video` or one loaded with its `uploader`, and returns the same type it was given.
+- **It reuses `visibleStatuses` from Stage 1,** so a viewer can't open by id a video the list wouldn't show them.
+
+### 404 or 403?
+
+The project convention: **404 for things you may not know exist, 403 for things you can see but not change.**
+
+| Who | Video | GET | PATCH |
+|---|---|---|---|
+| not in the club | any | 404 | 404 |
+| viewer | READY | 200 | **403** |
+| viewer | ERROR / PROCESSING | 404 | 404 |
+| club owner, not the uploader | any | 200 | **403** |
+| uploader, still club owner or admin | own | 200 | 200 |
+| uploader, demoted to viewer | own, READY | 200 | **403** |
+| club admin | any | 200 | 200 |
+
+A 403 for a non-member would confirm "this id exists, you just can't have it". A 404 gives nothing away. A viewer **can** see a READY video, so for them a refused edit really is a 403.
+
+### Who may edit
+
+```ts
+const canManage = (video: Pick<Video, 'uploadedBy'>, role: ClubRole, userId: string) =>
+  role === 'admin' || (video.uploadedBy === userId && UPLOADER_ROLES.includes(role));
+```
+
+Owning the video isn't enough on its own: an uploader who is demoted to viewer loses the right to edit their old videos. Rights come from your **current** role. `uploadedBy` only decides which videos a club owner's rights apply to.
+
+### PATCH semantics: missing, `null` and `""`
+
+| Body | Effect on `description` |
+|---|---|
+| field left out | unchanged |
+| `"description": "text"` | set, trimmed |
+| `"description": null` | cleared |
+| `"description": ""` | cleared (turned into `null`, so "empty" has one representation) |
+
+This works because Zod leaves a missing key as `undefined`, and Drizzle's `.set()` skips `undefined` keys. The parsed body goes straight to `updateDetails`, and only the fields you sent are written. `updated_at` changes on every edit, because the shared `timestamps` columns have `$onUpdate`.
+
+**Unknown fields are dropped.** A Zod object strips keys it doesn't declare, so `{"status":"READY","title":"x"}` changes only the title. Without that, passing the body to `.set()` would let a client write any column, including `status`, `clubId` or `uploadedBy`. That bug is called **mass assignment**, and the schema is the allow-list that prevents it.
+
+### A validation bug this stage found
+
+`PATCH {}` must fail, so the schema has a check on the whole body:
+
+```ts
+.refine((body) => body.title !== undefined || body.description !== undefined, {
+  error: 'Send a title, a description, or both.',
+})
+```
+
+The first test returned `400` with `"details": { "body": {} }`, so the message was lost. `validate.middleware.ts` only kept `fieldErrors` from `z.flattenError`. An error about the whole object isn't tied to a field, so Zod puts it in `formErrors` instead. The same gap hid the message for a body like `[]` on **every** route. The middleware now keeps both:
+
+```ts
+const { formErrors, fieldErrors } = z.flattenError(result.error);
+issues[part] = formErrors.length > 0 ? { _errors: formErrors, ...fieldErrors } : fieldErrors;
+```
+
+`_errors` is the name Zod's own `format()` uses for errors about the object itself. Results:
+
+```text
+PATCH {}                            → { body: { _errors: ['Send a title, a description, or both.'] } }
+PATCH []                            → { body: { _errors: ['Invalid input: expected object, received array'] } }
+POST /clubs []                      → the same, on another route
+PATCH {"title":"","description":5}  → { body: { title: [...], description: [...] } }   (unchanged)
+```
+
+### Races worth knowing about
+
+- **The video is deleted between the load and the update.** `updateDetails` then matches no row and returns `undefined`, and the service answers 404. No lock is needed, because the update is a single statement on one row.
+- **The role changes between the check and the update.** A demotion landing in that gap would let one last edit through. For a title edit that's harmless. Where it matters, as with the download quota in Stage 6, the check and the change go into one atomic statement.
+
+### What was tested
+
+| Case | Result |
+|---|---|
+| admin GET READY / ERROR | 200; the ERROR video shows its `errorMessage` |
+| unknown id / `not-a-uuid` | 404 `VIDEO_NOT_FOUND` / 400 with the param message |
+| a user from no club | 404 |
+| viewer GET READY / ERROR | 200 / 404 |
+| viewer PATCH READY / ERROR | 403 / 404 |
+| club owner PATCH someone else's video | 403 |
+| uploader as club owner / demoted to viewer | 200 / 403 |
+| admin PATCH both fields, `""` description, title only | 200; trimmed; cleared; `updatedAt` changes each time |
+| `{}`, `[]`, blank title | 400 with a message |
+| `{"status":"READY","title":"x"}` | only the title changed |
