@@ -15,8 +15,9 @@ Related: [indexes.md](indexes.md) (how B-tree indexes work) · [transactions.md]
 7. [Stages 2–3: one video, viewing and editing](#7-stages-23-one-video-viewing-and-editing)
 8. [Stage 4: deleting a video](#8-stage-4-deleting-a-video)
 9. [Stage 5: signed HLS streaming](#9-stage-5-signed-hls-streaming)
+10. [Stage 6: downloads and an atomic quota](#10-stage-6-downloads-and-an-atomic-quota)
 
-Coming in later stages: atomic download quotas.
+Coming in later stages: reading and raising a club's quota.
 
 ---
 
@@ -536,7 +537,7 @@ The raw delete uses the **prefix**, not `raw_path`, so anything under that video
 
 - **Delete runs inside the request.** 2,500 objects took **8.2 s** against local RustFS: three list calls and three `DeleteObjects` calls, each waiting on the one before. A 2-hour video has ~3,600 segments across its renditions, so that's fine for now, but a platform with 10-hour videos would mark the row `DELETING`, return `202 Accepted`, and let a queue job do the cleanup with retries.
 - **`requeue-stuck` could race a delete.** If the operator script re-enqueues a stuck `PROCESSING` video in the moment between our job removal and our row delete, a job is created for a video that then disappears. The worker loads the row, finds nothing, and fails the job as `UnrecoverableError('Video not found')` without retrying. That's harmless, just noise in Bull Board.
-- **Download history.** Until Stage 6, `download_logs.video_id` is `ON DELETE CASCADE`, so deleting a video erases its download history. Stage 6 changes that.
+- **Download history.** Deleting a video keeps its `download_logs` rows: `video_id` becomes `NULL` and `club_id` stays (migration 0004, section 10).
 
 ### What was tested
 
@@ -674,3 +675,130 @@ The first attempt reloaded the whole source with `hls.loadSource()`. It worked, 
 | admin, ERROR video / viewer, ERROR video / unknown id | 409 `VIDEO_NOT_READY` / 404 / 404 |
 | instance with `STREAM_URL_TTL_SECONDS=10`: segment URL fresh / after 12 s | 200 / 403 `AccessDenied` |
 | dev player in API mode against that instance, in Chrome | plays; a 403 every ~12 s is followed by fresh URLs and a successful retry; playback reached 48.5 s with no restart |
+
+
+---
+
+## 10. Stage 6: downloads and an atomic quota
+
+```text
+POST /videos/:videoId/download → { download: { url, filename, sizeBytes, expiresAt }, quota: { limit, used, remaining } }
+                               → 403 QUOTA_EXCEEDED · 404 VIDEO_NOT_FOUND / VIDEO_FILE_MISSING · 409 VIDEO_NOT_READY
+```
+
+Each club has a row in `download_quotas` (created with the club, in the same transaction) holding a `quota_limit` (default 100) and a `used_count`. Every download uses one unit and is written to `download_logs`.
+
+**Why POST?** It changes state: it uses quota and writes a log row. A `GET` must be safe to repeat, and browsers, link previewers and prefetchers do repeat GETs. A GET that used quota would get used up by a chat app rendering a link preview.
+
+### The race, measured
+
+The rule is "grant a download only while `used_count < quota_limit`". Here are four ways to write that, each hit by **20 parallel requests with 5 units left**. They ran against a scratch table through the app's pool of 10 connections, with a 2 ms pause between the read and the write to stand in for real work:
+
+| Approach | Granted | `used` afterwards |
+|---|---|---|
+| A. `SELECT used`; check in JS; `UPDATE SET used = <read + 1>` | **20** | **2** / 5 |
+| B. `SELECT used`; check in JS; `UPDATE SET used = used + 1` | **13–14** | **13–14** / 5 |
+| C. `SELECT … FOR UPDATE`; check; `UPDATE SET used = used + 1` | 5 | 5 / 5 |
+| D. `UPDATE … SET used = used + 1 WHERE used < lim RETURNING` | 5 | 5 / 5 |
+
+- **A has two bugs.** Ten transactions read `used = 0` at the same moment, all pass the check, and all write `1`. Every request got a download, and the counter shows 2: **lost updates**. Each write overwrote the others.
+- **B fixes the counter but not the check.** `used = used + 1` is computed by Postgres from the current row, so no increment is lost. The *decision* was still made from a stale read, though, so 13 downloads were granted against a limit of 5. **Oversold.**
+- **C works,** because `FOR UPDATE` makes every other transaction wait at the `SELECT` until the first one commits. But it's three round trips holding a lock, and it needs a transaction just for that.
+- **D is one statement.** Postgres locks the row, re-checks `used < lim` against the **latest committed** version (READ COMMITTED re-evaluates the `WHERE` after waiting for a lock; see [transactions.md](transactions.md)), and increments it, all at once. 0 rows returned means "no quota left". There's no gap between check and write, because they're the same operation.
+
+What we ship is D, plus the log insert, in one transaction:
+
+```ts
+export const consumeQuotaAndLog = (record: DownloadRecord) =>
+  db.transaction(async (tx) => {
+    const [quota] = await tx
+      .update(downloadQuotas)
+      .set({ usedCount: sql`${downloadQuotas.usedCount} + 1` })
+      .where(and(eq(downloadQuotas.clubId, record.clubId), lt(downloadQuotas.usedCount, downloadQuotas.quotaLimit)))
+      .returning({ limit: downloadQuotas.quotaLimit, used: downloadQuotas.usedCount });
+    if (!quota) return undefined;
+    await tx.insert(downloadLogs).values(record);
+    return quota;
+  });
+```
+
+The transaction is there for the **pair**: if the log insert fails, the quota increment rolls back too, so `used_count` always equals the number of log rows. The function **returns** `undefined` rather than throwing `QUOTA_EXCEEDED` itself. The service throws after the transaction ends (rule 4 in [transactions.md](transactions.md)), and repositories don't build HTTP errors.
+
+**Measured against the real endpoint:** 20 parallel `POST /download` with the limit set to `used + 5` gave **5 × 200 and 15 × 403 `QUOTA_EXCEEDED`** in 285 ms. `used_count` ended exactly at `quota_limit`, with exactly 5 new log rows. The five successes reported `remaining` 4, 3, 2, 1, 0: each saw a different committed state.
+
+### What happens in which order
+
+```mermaid
+flowchart TD
+    R["POST /videos/:id/download"] --> V["requireVisible<br/>(404 if you can't see it)"]
+    V --> S{"READY?"}
+    S -- no --> C409["409 VIDEO_NOT_READY"]
+    S -- yes --> H["HEAD the raw object"]
+    H -- missing --> F404["404 VIDEO_FILE_MISSING<br/>(no quota used)"]
+    H -- ok --> T["transaction: UPDATE quota … WHERE used < limit<br/>+ INSERT download_logs"]
+    T -- "0 rows" --> Q403["403 QUOTA_EXCEEDED"]
+    T -- "1 row" --> P["presign GetObject, 5 min,<br/>ResponseContentDisposition: attachment"]
+    P --> OK["200 { download, quota }"]
+```
+
+- **Check the file exists before charging.** A `HeadObject` is cheap, and it means a club never pays for a link to a missing file. It runs **before** the transaction, so no lock is held during a network call.
+- **Sign after commit.** Signing can't fail in a way that matters, and keeping it out of the transaction keeps the row lock as short as possible.
+- **Quota is used when the link is created.** Storage can't tell the API that a download finished, so creating the link is the only moment the API can count reliably. A user who asks for a link and never uses it has still used one unit. That's the usual trade-off; a CDN with access logs could count completed downloads instead.
+
+### `Content-Disposition`: making the browser save, with a safe filename
+
+A presigned `GetObject` can carry `ResponseContentDisposition`. Storage then sends that value as the `Content-Disposition` header, so the browser **saves** the file instead of playing it in a tab. The value is part of the signed query string: change `attachment` to `inline` and storage returns 403. The server decides how the file is delivered, not the client.
+
+The filename comes from the video title, which users type, so it's untrusted input that ends up in a **response header**:
+
+```ts
+downloadFilename('Ünïcödé "final" / cut?\r\nSet-Cookie: x=1', '…/original.mov')
+  → 'Ünïcödé final cut Set-Cookie x=1.mov'
+attachment('Démo final cut v2.mp4')
+  → attachment; filename="D_mo final cut v2.mp4"; filename*=UTF-8''D%C3%A9mo%20final%20cut%20v2.mp4
+```
+
+- **CR/LF and other control characters are removed.** A raw `\r\n` in a header value is **header injection**: the title above would add a `Set-Cookie` header to the response. (The SDK and storage would likely reject it, but sanitising at the source means we don't rely on that.)
+- **`" \ / : * ? < > |` are removed.** A quote would end the `filename="…"` value early. A slash would read as a folder. The rest aren't allowed in Windows filenames.
+- **Two forms of the name.** `filename="…"` is the ASCII fallback for old clients (non-ASCII letters become `_`). `filename*=UTF-8''…` is the [RFC 6266](https://www.rfc-editor.org/rfc/rfc6266) form with the real name, percent-encoded. Browsers prefer it, so the saved file is named `Démo final cut v2.mp4`. `encodeURIComponent` leaves `'()*` unencoded, but RFC 5987 requires them encoded, hence the extra `replace`.
+- **The extension comes from the stored key** (`original.mov` → `.mov`), not from the title.
+
+### History that survives a delete (migration 0004)
+
+`download_logs.video_id` used to be `NOT NULL … ON DELETE CASCADE`, so deleting a video erased its download history, and with it the club's record of what its quota was spent on. Migration `0004_download_logs_keep_history`:
+
+- makes `video_id` nullable with `ON DELETE SET NULL`, so the row stays and only loses its link;
+- adds `club_id NOT NULL … ON DELETE CASCADE`, so history still belongs to a club after its video is gone, and goes away only with the club;
+- adds the index `(club_id, downloaded_at)` for "this club's downloads, newest first".
+
+**Drizzle generated `ADD COLUMN "club_id" uuid NOT NULL`.** That fails on any table that already has rows, because Postgres can't invent a value. The migration hadn't been applied anywhere, so it was edited (an applied migration must never be edited) into the safe three-step form:
+
+```sql
+ALTER TABLE "download_logs" ADD COLUMN "club_id" uuid;
+UPDATE "download_logs" SET "club_id" = "videos"."club_id" FROM "videos" WHERE "videos"."id" = "download_logs"."video_id";
+ALTER TABLE "download_logs" ALTER COLUMN "club_id" SET NOT NULL;
+```
+
+That was proven before applying it: inside `BEGIN … ROLLBACK`, insert a log row, run the migration SQL, check that `club_id` was filled in from the video, then roll back.
+
+**Measured:** upload a video, download it, delete it. The log row is still there with `video_id = NULL` and `club_id` set.
+
+### Known gaps
+
+- **The quota never resets.** `used_count` is a lifetime counter. A monthly quota would need a `period_start` column and a reset (a scheduled job, or a lazy `UPDATE … SET used_count = 0, period_start = now() WHERE period_start < date_trunc('month', now())` before the increment).
+- **Retries use quota.** A client that times out and retries uses two units. An `Idempotency-Key` header, stored with the log row, would let the second request return the first one's result.
+
+### What was tested
+
+| Case | Result |
+|---|---|
+| viewer downloads the READY demo | 200; `Two-minute demo (1080p).mp4`, 297,873,717 bytes; quota `used 1, remaining 99`; log row has `club_id` |
+| fetch the URL (`Range: bytes=0-1023`) | 206, `video/mp4`, `Content-Disposition: attachment; filename="Two-minute demo (1080p).mp4"; filename*=UTF-8''…` |
+| same URL with `response-content-disposition=inline` | 403 (the signature covers it) |
+| title `Démo "final" cut / v2`, end to end | storage sends `filename="D_mo final cut v2.mp4"; filename*=UTF-8''D%C3%A9mo%20final%20cut%20v2.mp4` |
+| viewer, ERROR video / admin, ERROR video / no token | 404 / 409 `VIDEO_NOT_READY` / 401; quota unchanged |
+| READY row whose raw object is missing | 404 `VIDEO_FILE_MISSING`; quota unchanged |
+| 20 parallel requests, 5 units left | 5 × 200, 15 × 403 `QUOTA_EXCEEDED`, `used = limit`, 5 log rows, `remaining` 4…0 |
+| download, then delete the video | log row kept: `video_id NULL`, `club_id` set |
+
+The test reset the quota to `limit 100, used 0` and removed its log rows afterwards.

@@ -232,7 +232,7 @@ flowchart TB
         USERS["users<br/>U: unique(email), unique(provider, provider_id)<br/>A: token_version = token_version + 1"]
         CLUBS["clubs"]
         MEM["club_members<br/>P: FOR UPDATE (admins + target)"]
-        QUO["download_quotas"]
+        QUO["download_quotas<br/>C+A: used_count + 1 WHERE used_count < quota_limit"]
         INV["club_invitations<br/>C: claim = UPDATE … WHERE status=pending<br/>U: unique(token_hash), unique(club_id, email) WHERE pending"]
         VID["videos<br/>P: FOR UPDATE WHERE status=UPLOADING (withUploadLock)<br/>C: transition = UPDATE … WHERE status=from"]
         CLUBS --> MEM
@@ -257,6 +257,7 @@ flowchart TB
 | 9 | Worker: READY / ERROR | `markVideoReady`, `markVideoFailed` → `transition` | no | **C** | single statement; 0 rows = someone else moved it |
 | 10 | Register, Google sign-in, invite | `user.repository.ts`, `invitation.repository.ts` `create` | no | **U** + catch `23505` → 409 | the index is the real guard; the pre-check is just for a nicer message |
 | 11 | Log out everywhere, password change | `bumpTokenVersion`, `updatePassword` | no | **A** `token_version + 1` | no read-modify-write in Node |
+| 12 | Download a video (Sprint 7) | `download.repository.ts` `consumeQuotaAndLog` | yes, UPDATE + INSERT | **C** `used_count < quota_limit` + **A** `used_count + 1` | quota and log row together; see [playback.md](playback.md#10-stage-6-downloads-and-an-atomic-quota) |
 
 A single `UPDATE` or `INSERT` is already its own transaction (auto-commit). You only need `db.transaction` when **two or more statements** have to succeed or fail together, or when a lock must be **held across** several steps.
 
@@ -510,7 +511,7 @@ The order is chosen so that the failure that's left over is harmless. An S3 sess
 | How does it commit? | The callback returns |
 | How does it roll back? | The callback throws, or any statement errors |
 | Pessimistic locks | `lockMember` (admins + target), `withUploadLock` (video row) |
-| Conditional writes | `transition`, `claim`, `revoke`, `markExpired` |
+| Conditional writes | `transition`, `claim`, `revoke`, `markExpired`, `consumeQuotaAndLog` |
 | Unique guards | `users_email_uniq`, `users_provider_uniq`, `club_invitations_token_uniq`, `club_invitations_pending_uniq` |
 | Connections per process | `DB_POOL_MAX` (10); a transaction holds one for its whole life |
 
