@@ -4,7 +4,7 @@ Sprint 6 turns the raw upload into something every viewer can play. This guide e
 
 The numbers below were **measured on this project**: the 4K sample in `bruno/videos/fixtures/`, FFmpeg 9 on Windows, 8 cores, `-preset veryfast`.
 
-Related: [queues.md](queues.md) (jobs, retries, flows) · [uploads.md](uploads.md) (how the raw file got into RustFS) · [NOTES.md](../NOTES.md) (measurements).
+Related: [queues.md](queues.md) (jobs, retries, flows) · [uploads.md](uploads.md) (how the raw file got into RustFS).
 
 **Reviewing Sprint 6?** Read sections 1–9 for the concepts (HLS, the ladder, keyframes, FFmpeg, single job vs Flow vs step job), section 10 for how the pipeline behaves and how it was tested, then [section 11](#11-code-walkthrough-reviewing-sprint-6) with the code open: it goes through every file in reading order and ends with a review checklist.
 
@@ -473,7 +473,7 @@ flowchart LR
 | 4. Thumbnail | Done | `worker/pipeline/thumbnail.ts`: `thumbnailTime`, `makeThumbnail` |
 | 5. Upload outputs | Done | `lib/storage/objects.ts` (`uploadObject`), `worker/pipeline/upload.ts` (`uploadDir`, `uploadFile`, `contentTypeFor`) |
 | 6. Wire the processor | Done | `worker/video.processor.ts`, `worker.ts`, `services/video.service.ts` (`outputKeys`, `markVideoReady`, `deleteVideoOutputs`), `lib/storage/objects.ts` (`deletePrefix`) |
-| 7. Prove it | Done (GIF pending) | `scripts/hls-player.ts` (`npm run videos:play`): READY list, hls.js player, quality log, built-in network throttle. Results in [NOTES.md](../NOTES.md) |
+| 7. Prove it | Done (GIF pending) | `scripts/hls-player.ts` (`npm run videos:play`): READY list, hls.js player, quality log, built-in network throttle |
 
 ### Thumbnail (Stage 4)
 
@@ -582,7 +582,7 @@ Every successful job logs `outputs uploaded` with per-phase timings. For the 4K 
 |---|---|---|---|---|---|---|---|
 | 1.3–2.7 s | 1.1–1.2 s | 35.0–36.9 s | 1.3–1.6 s | 0.4–0.5 s | ~42 s | 239 MB | 36 MB, 22 files |
 
-That's `secondsPerGb: 178`, about **3 minutes per GB**, for a 4K H.264 source on 8 cores. It's per GB of *this* source; a 1080p source of the same size has more seconds of video, so it decodes faster per second but has more of them. Stage 7 measures more inputs for `NOTES.md`.
+That's `secondsPerGb: 178`, about **3 minutes per GB**, for a 4K H.264 source on 8 cores. It's per GB of *this* source; a 1080p source of the same size has more seconds of video, so it decodes faster per second but has more of them. Stage 7 measures more inputs.
 
 **Download speed, for the record:** the 229 MB raw object streamed from RustFS to disk in 1.2–2.5 s. The transcode (46 s for 32 s of 4K) is roughly 20–40× the download, so the download is not worth optimising.
 
@@ -1439,7 +1439,7 @@ cd backend && npm run videos:play        # then open http://localhost:4100
 | FFmpeg 5.1 in the container vs 9.0 on Windows | Different `BANDWIDTH` values in the master playlist; options must work in both | Pin or upgrade when it matters |
 | `maxStalledCount` is BullMQ's default (1) | A job whose worker crashes twice is failed as stalled. Graceful shutdowns don't count (they use `moveToWait`) | Revisit if crashes become common |
 | No `Cache-Control` on HLS objects | Segments never change and could be cached for a year; playlists for short times | With a CDN, later |
-| `secondsPerGb` depends on the source bitrate | A 1080p GB has 4× more video than a 4K GB; time relative to video length is steadier ([NOTES.md](../NOTES.md)) | Log both if needed |
+| `secondsPerGb` depends on the source bitrate | A 1080p GB has 4× more video than a 4K GB; time relative to video length is steadier | Log both if needed |
 | 26 READY rows from the Sprint 5 stub have no files | The player filters them out; a real list endpoint should too | Clean up the demo data, or filter in Sprint 7 |
 
 

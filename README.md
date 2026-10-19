@@ -36,7 +36,7 @@ flowchart LR
     HLS -- "8 · segments on 5-minute signed URLs" --> P
 ```
 
-Measured on a laptop: a 4K, 32 s clip (239 MB) transcodes in ~42 s; a 1080p, 2-minute clip (298 MB) in ~133 s. Details in [NOTES.md](docs/NOTES.md).
+Measured on a laptop: a 4K, 32 s clip (239 MB) transcodes in ~42 s; a 1080p, 2-minute clip (298 MB) in ~133 s. Details in [transcoding](docs/learning/transcoding.md).
 
 | | |
 |---|---|
