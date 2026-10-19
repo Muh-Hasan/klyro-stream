@@ -2,6 +2,8 @@
 
 Sprint 8 makes the API **tell** clients when something happens, instead of waiting to be asked. While a video transcodes, its club sees the progress; when it's done, a `video:ready` event arrives and the uploader gets an email. This guide grows one section per stage. Timings and outputs were **measured on this project**.
 
+**Reviewing Sprint 8?** Read sections 1–5 for the concepts, sections 6–11 for each stage and how it was tested, then [section 12](#12-code-walkthrough-reviewing-sprint-8) with the code open: it goes through every file in reading order and ends with a review checklist.
+
 Related: [queues.md](queues.md) (BullMQ, workers, retries) · [transcoding.md](transcoding.md) (what the worker does while you wait) · [playback.md](playback.md) (who may see which video) · [transactions.md](transactions.md) (the outbox idea, for later).
 
 **Contents**
@@ -17,6 +19,7 @@ Related: [queues.md](queues.md) (BullMQ, workers, retries) · [transcoding.md](t
 9. [Stage 5: email through a queue](#9-stage-5-email-through-a-queue)
 10. [Stage 6: the listener script](#10-stage-6-the-listener-script)
 11. [Stage 7: more than one API process](#11-stage-7-more-than-one-api-process)
+12. [Code walkthrough: reviewing Sprint 8](#12-code-walkthrough-reviewing-sprint-8)
 
 ---
 
@@ -745,3 +748,398 @@ That's why the relay uses `io.local` (decision 8): every instance hears every qu
 | same, with the adapter | `club:membership { role: 'club_owner' }` on `:4001` |
 | one upload, admin on each instance + viewer on `:4001`, with and without the adapter | each client: exactly 1 `video:ready`; admins 4–6 progress each, viewer 0 |
 | two servers sharing the adapter, both emitting | `io.to` → 2 per client; `io.local.to` → 1 per client |
+
+
+---
+
+## 12. Code walkthrough: reviewing Sprint 8
+
+This section goes through **every file Sprint 8 added or changed**, in the order that makes them easiest to follow: from a socket connecting, through rooms and events, to the email queue. For each file: what it's for, the code that matters, why it's written that way, and how to check it yourself. `git diff 587b47e HEAD -- backend` shows the whole sprint: 24 files, +646 / −39.
+
+### Reading order
+
+```mermaid
+flowchart TD
+    A["1 · realtime/events.ts<br/>the protocol"] --> B["2 · realtime/server.ts<br/>auth, expiry, adapter, shutdown"]
+    B --> C["3 · realtime/rooms.ts + utils/roles.ts<br/>room names, membership sync"]
+    C --> D["4 · realtime/club-handlers.ts<br/>club:join / club:leave"]
+    D --> E["5 · member.service.ts<br/>calls syncMembership"]
+    E --> F["6 · lib/queue: connection.ts, queues.ts"]
+    F --> G["7 · realtime/video-events.ts<br/>queue events → rooms"]
+    G --> H["8 · notification.service.ts<br/>+ worker/notification.processor.ts"]
+    H --> I["9 · worker.ts, video.processor.ts, mailer.ts"]
+    I --> J["10 · server.ts, tokens.ts, env"]
+    J --> K["11 · scripts/socket-listen.ts"]
+```
+
+| # | File | Lines | Kind |
+|---|---|---|---|
+| 1 | `realtime/events.ts` | 43, new | Types only: what each side may send |
+| 2 | `realtime/server.ts` | 90, new | Socket server: auth, expiry, adapter |
+| 3 | `realtime/rooms.ts`, `utils/roles.ts` | 66, new | Room rules; the server reference; one role ranking |
+| 4 | `realtime/club-handlers.ts` | 74, new | Client requests, validated and wrapped |
+| 5 | `services/member.service.ts`, `middleware/require-club-role.middleware.ts`, `services/video.service.ts` | +21 | Membership sync calls; shared roles |
+| 6 | `lib/queue/connection.ts`, `lib/queue/queues.ts` | +47 | `events` connection, `notifications` queue, `enqueueEmail` |
+| 7 | `realtime/video-events.ts` | 88, new | The relay |
+| 8 | `services/notification.service.ts`, `worker/notification.processor.ts` | 55, new | Email content and sending |
+| 9 | `worker.ts`, `worker/video.processor.ts`, `lib/mail/mailer.ts`, `auth.service.ts`, `invitation.service.ts` | +60 | Second BullMQ worker, timeouts, queued emails |
+| 10 | `server.ts`, `utils/tokens.ts`, `config/env.ts`, `.env.example`, `package.json` | +30 | Wiring and config |
+| 11 | `scripts/socket-listen.ts` | 111, new | Reference client |
+
+### The layering
+
+```mermaid
+flowchart LR
+    subgraph In["entry points"]
+        RT["routes / controllers<br/>HTTP"]
+        SK["realtime/server + club-handlers<br/>sockets"]
+        WK["worker/*<br/>jobs"]
+    end
+    SV["services<br/>rules"]
+    RP["repositories<br/>SQL"]
+    subgraph Out["outputs"]
+        Q["lib/queue<br/>Redis jobs"]
+        RM["realtime/rooms<br/>room changes"]
+    end
+    RT --> SV
+    SK --> RP
+    WK --> SV
+    SV --> RP
+    SV --> Q
+    SV --> RM
+    RL["realtime/video-events<br/>queue events → sockets"] --> RP
+    RL --> RM
+```
+
+- **Sockets are an entry point like HTTP.** `club-handlers.ts` checks membership with `clubRepo.getMemberRole`, as `requireClubRole` does for routes.
+- **`rooms.ts` is an output like the queue.** Services call `syncMembership` the way they call `enqueueEmail`: after their database work, never inside a transaction, and without failing if it fails.
+- **Nothing in `realtime/` is imported by the worker** except through services, and `syncMembership` is a no-op when no socket server exists. So the worker process can share every service without starting a socket server.
+
+---
+
+### 1. `realtime/events.ts`: the protocol
+
+```ts
+export type ClientToServerEvents = {
+  'club:join': (clubId: unknown, ack?: Ack) => void;
+  'club:leave': (clubId: unknown, ack?: Ack) => void;
+};
+
+export type ServerToClientEvents = {
+  'auth:expired': () => void;
+  'video:progress': (event: VideoProgressEvent) => void;
+  'video:ready': (event: VideoReadyEvent) => void;
+  'video:failed': (event: VideoFailedEvent) => void;
+  'club:membership': (change: { clubId: string; role: ClubRole | null }) => void;
+};
+```
+
+- **`clubId: unknown` and `ack?`** describe what can actually arrive over the wire, which is anything. TypeScript then forces the handler to validate both instead of trusting a type the client never promised to honour.
+- **One file for both sides.** The server's `Server<...>` and the script's `Socket<...>` use the same maps. This file **is** the API documentation for sockets, the way the Bruno collection is for HTTP.
+
+---
+
+### 2. `realtime/server.ts`: the socket server
+
+```ts
+export const createRealtime = (httpServer: HttpServer): RealtimeServer => {
+  const io: RealtimeServer = new Server(httpServer, {
+    cors: { origin: env.FRONTEND_URL },
+    maxHttpBufferSize: MAX_MESSAGE_BYTES,
+    adapter: createAdapter(adapterClient('pub'), adapterClient('sub')),
+  });
+  io.use(authenticate);
+  io.on('connection', onConnection);
+  setRealtime(io);
+  return io;
+};
+```
+
+Read in order:
+
+1. **Attached to the existing HTTP server,** so sockets share port 4000 and the same process lifecycle. Socket.io takes over requests to `/socket.io/`; everything else still goes to Express.
+2. **`cors`** applies to the long-polling transport only (section 4).
+3. **`maxHttpBufferSize`** of 16 KB caps a client message (section 2).
+4. **`adapter`** with two dedicated Redis connections (section 11).
+5. **`io.use(authenticate)`** runs once per connection, before `connection` (section 3).
+6. **`setRealtime(io)`** hands the instance to `rooms.ts`, so services can reach it without importing the server.
+
+```ts
+const onConnection = (socket: RealtimeSocket) => {
+  const { userId } = socket.data;
+  void socket.join(userRoom(userId));
+  disconnectAtExpiry(socket);
+  registerClubHandlers(socket);
+  ...
+};
+```
+
+`void socket.join(...)`: `join` returns a promise only with some adapters. Here the socket is local, so it's effectively synchronous, and `void` says "not awaited, on purpose".
+
+```ts
+export const closeRealtime = async (io: RealtimeServer) => {
+  setRealtime(undefined);
+  await io.close();
+  await Promise.all(adapterClients.splice(0).map((client) => client.quit()));
+};
+```
+
+The order matters. First stop services from using the server; then disconnect every socket and close the HTTP server (`io.close()`, section 5); then close the adapter's Redis connections, which would otherwise keep the process alive. `splice(0)` empties the list as it reads it, so a second call is harmless.
+
+**Check it yourself:** `docker exec klyro-redis-1 redis-cli client list | grep klyro:sockets` shows one pub and one sub per running API.
+
+---
+
+### 3. `realtime/rooms.ts` and `utils/roles.ts`
+
+```ts
+export const userRoom = (userId: string) => `user:${userId}`;
+export const clubRoom = (clubId: string) => `club:${clubId}`;
+export const managersRoom = (clubId: string) => `club:${clubId}:managers`;
+
+export const roomsFor = (clubId: string, role: ClubRole) =>
+  isManager(role) ? [clubRoom(clubId), managersRoom(clubId)] : [clubRoom(clubId)];
+```
+
+Room names are built in exactly one place. A typo like `club-${id}` in one file and `club:${id}` in another would be a silent bug: events go to a room nobody is in, with no error anywhere.
+
+```ts
+const rank: Record<ClubRole, number> = { viewer: 1, club_owner: 2, admin: 3 };
+export const hasRole = (role: ClubRole, min: ClubRole) => rank[role] >= rank[min];
+export const isManager = (role: ClubRole) => hasRole(role, 'club_owner');
+```
+
+`utils/roles.ts` replaces two copies of the same rule: the `rank` table in `requireClubRole`, and `UPLOADER_ROLES` in `video.service.ts`. Now "who counts as a manager" means the same thing for HTTP routes, video visibility and socket rooms.
+
+`syncMembership` (section 7) is fire-and-forget: it returns `void`, and its promise ends in `.then(log).catch(log)`. The caller has already committed its database change, and a realtime failure mustn't turn that into an error response.
+
+---
+
+### 4. `realtime/club-handlers.ts`
+
+```ts
+socket.on(
+  'club:join',
+  handle(socket, 'club:join', async (id) => {
+    const role = await clubRepo.getMemberRole(id, socket.data.userId);
+    if (!role) return clubNotFound;
+    const rooms = roomsFor(id, role);
+    await socket.leave(managersRoom(id));
+    await socket.join(rooms);
+    return { ok: true, clubId: id, role, rooms };
+  }),
+);
+```
+
+- **`leave(managersRoom)` before `join(rooms)`** makes `club:join` idempotent and self-correcting. Joining again after a demotion (while connected to an instance that missed the sync) drops the managers room instead of keeping it.
+- **`handle(...)`** does the validation, the missing-ack fallback and the error catching for every event (section 7). A new event is one more `socket.on(..., handle(...))` and gets all three.
+- **`club:leave` only checks `socket.rooms`,** not the database. Leaving a room you're in is always allowed, and if you're not in it the answer is `CLUB_NOT_FOUND`, the same as for a club you're not a member of.
+
+---
+
+### 5. Membership changes call into realtime
+
+```ts
+export const changeMemberRole = async ({ clubId }: Membership, userId: string, { role }: UpdateMemberInput) => {
+  await assertNotCreator(clubId, userId, "The club creator's role cannot be changed");
+  const member = await memberRepo.changeRole(clubId, userId, role);
+  syncMembership(userId, clubId, role);
+  return { member };
+};
+```
+
+`syncMembership` runs **after** `memberRepo.changeRole` returns, so after its transaction (with `FOR UPDATE` on the admins, Sprint 3) has committed. If the change throws (last admin, not found), no socket is touched. `removeMember` and `leaveClub` pass `null`.
+
+---
+
+### 6. `lib/queue`: a third connection and a second queue
+
+```ts
+type Role = 'producer' | 'worker' | 'events';
+...
+enableOfflineQueue: role !== 'producer',
+```
+
+The API now holds two queue connections: `producer` to add jobs, and `events` for `QueueEvents`, which blocks on `XREAD`. `enableOfflineQueue: false` stays for the producer only: an `add` while Redis is down should fail fast (Sprint 5's 2-second timeout). The events reader can simply wait until Redis is back.
+
+```ts
+const withTimeout = async <T>(work: Promise<T>): Promise<T> => { ... };
+
+export const enqueueTranscode = (videoId: string, requestId?: string) =>
+  withTimeout(videoQueue.add('transcode', { videoId, requestId }, { jobId: transcodeJobId(videoId) }));
+
+export const enqueueEmail = (mail: EmailJob, jobId?: string) =>
+  withTimeout(notificationQueue.add('send-email', mail, { jobId }));
+```
+
+The `Promise.race` + `AbortController` timeout from Sprint 5 became `withTimeout`, so both queues share it. `jobId` is optional: an undefined id lets BullMQ number the job, which is what a password reset wants (two resets are two emails).
+
+---
+
+### 7. `realtime/video-events.ts`: the relay
+
+```ts
+export const relayVideoEvents = (io: RealtimeServer) => {
+  const events = new QueueEvents(VIDEO_QUEUE, { connection: queueConnection('events') });
+  const lastSent = new Map<string, Sent>();
+  const clubIds = new Map<string, Promise<string | undefined>>();
+  ...
+  events.on('progress', ({ jobId, data }) => {
+    if (typeof data !== 'number') return;
+    relay('progress', jobId, (id) => onProgress(id, Math.floor(data)));
+  });
+  events.on('completed', ({ jobId }) => relay('completed', jobId, onCompleted));
+  events.on('failed', ({ jobId }) => relay('failed', jobId, onFailed));
+  events.on('error', (err) => logger.error({ err, queue: VIDEO_QUEUE }, 'queue events error'));
+  return events;
+};
+```
+
+- **State lives in the closure,** one `Map` per concern, and each video's entry is dropped on `completed` or `failed` (`forget`). There's no module-level state to reset in tests or leak between instances.
+- **`relay(...)`** is to the relay what `handle(...)` is to club handlers: it parses the job id, ignores jobs that aren't videos, and turns a thrown error into a log line instead of an unhandled rejection.
+- **`typeof data !== 'number'`:** BullMQ progress can be any JSON. The worker reports numbers, but the relay checks rather than assumes.
+- **`io.local.to(...)`** everywhere (section 11).
+- **`completed` and `failed` re-read the row** and check its status, so a stale or replayed event can't announce something the database disagrees with.
+
+It returns the `QueueEvents` instance so `server.ts` can close it on shutdown, before the queue connections it uses are closed.
+
+---
+
+### 8. Email: content and delivery
+
+#### `services/notification.service.ts`
+
+```ts
+const oneLine = (text: string) => text.replace(/\p{Cc}+/gu, ' ').trim();
+
+export const videoEmailJobId = (kind: VideoEmail, videoId: string) => `email-video-${kind}-${videoId}`;
+
+const notify = (kind: VideoEmail, videoId: string) =>
+  queueVideoEmail(kind, videoId).catch((err: unknown) =>
+    logger.error({ err, videoId, kind }, 'could not queue the video email'),
+  );
+```
+
+- **The id prefix is `email-video-…`,** not `video-…`. `videoIdFromJobId` would read a `video-ready-<id>` job as the video `ready-<id>` if the two queues' ids were ever mixed up.
+- **The email is built where the data is:** the uploader's address and the title come from one `findWithUploader` query, and the job gets the finished email.
+- **`notify` never rejects**, so the processor can `await` it without a try/catch and without risking the transcode result.
+
+#### `worker/notification.processor.ts`
+
+```ts
+export const processEmail = async (job: Job<EmailJob>) => {
+  const log = logger.child({ jobId: job.id, attempt: job.attemptsMade + 1 });
+  try {
+    await sendMail(job.data);
+  } catch (err) {
+    log.warn({ err }, 'email not sent, will retry');
+    throw err;
+  }
+  log.info({ subject: job.data.subject }, 'email sent');
+};
+```
+
+Throwing is how a BullMQ processor says "retry me". The warning says *will retry* because the final failure is reported separately, by the worker's `failed` listener, at error level. The `to` address is logged only there, not on every attempt.
+
+---
+
+### 9. The worker process and the mailer
+
+```ts
+const emailWorker = new Worker<EmailJob>(NOTIFICATION_QUEUE, processEmail, {
+  connection: queueConnection('worker'),
+  concurrency: EMAIL_CONCURRENCY,
+});
+
+emailWorker.on('failed', (job, err) => {
+  if (job && job.attemptsMade >= (job.opts.attempts ?? 1)) {
+    logger.error({ jobId: job.id, err, to: job.data.to }, 'email gave up after every retry');
+  }
+});
+```
+
+- **One process, two workers.** Video jobs keep `concurrency: 1`, because FFmpeg uses every core. Emails get 5, because they spend their time waiting on the network. Splitting them into separate processes is possible later without code changes, since both use the same `queueConnection('worker')` and queue names.
+- **Worker `failed` fires on every failed attempt,** unlike `QueueEvents` `failed` (section 8), hence the `attemptsMade >= attempts` check to log only the final one.
+
+```ts
+const closing = Promise.all([videoWorker.close(), emailWorker.close()]);
+stopActiveJobs();
+await closing;
+closeMailer();
+```
+
+Both workers stop taking jobs at once. `stopActiveJobs()` aborts FFmpeg (Sprint 6). A send that's in progress finishes or times out (`socketTimeout: 30_000`, inside the 30-second shutdown limit), and only then does the SMTP transport close.
+
+`video.processor.ts` gained one line in each outcome: `await notifyVideoReady(videoId)` after the READY update wins, and `await notifyVideoFailed(videoId)` in `failForGood` after the ERROR update wins.
+
+`mailer.ts` gained the three timeouts (section 9). `auth.service.ts` and `invitation.service.ts` swapped `sendMail` for `enqueueEmail` and kept their `void … .catch(log)` shape: the request still never waits for the queue, and a failed **enqueue** is logged with its own message (`could not queue the reset email`).
+
+---
+
+### 10. Wiring and configuration
+
+```ts
+const server: Server = createApp().listen(env.PORT, () => { ... });
+
+const realtime = createRealtime(server);
+const videoEvents = relayVideoEvents(realtime);
+...
+const closing = closeRealtime(realtime);
+server.closeIdleConnections();
+await closing;
+
+const results = await Promise.allSettled([
+  Promise.allSettled([closeQueues(), videoEvents.close()]).finally(closeQueueConnections),
+  closeDb(),
+  closeRedis(),
+]);
+```
+
+Queues and `QueueEvents` close before their connections are quit. The API no longer imports the mailer at all, so `closeMailer()` left `server.ts`.
+
+```ts
+export const readAccessToken = (token: string): { userId: string; expiresAt: number } => {
+  const { sub, exp } = verify(token, env.JWT_ACCESS_SECRET);
+  if (!exp) throw new Error('Access token has no expiry');
+  return { userId: sub, expiresAt: exp * 1000 };
+};
+```
+
+A token without `exp` is refused for sockets, since the expiry timer depends on it. `verifyAccessToken` (HTTP) is unchanged.
+
+`VIDEO_URL` (default `http://localhost:5173/videos`) builds the link in "ready" emails. It has a default, so existing `.env` files keep working.
+
+---
+
+### 11. `scripts/socket-listen.ts`
+
+Covered in section 10. When reviewing, check the three things every real client must also do:
+
+- [ ] `club:join` inside `on('connect')`, so it runs again after every reconnect.
+- [ ] `auth` as a **function**, so a reconnect sends the current token.
+- [ ] `auth:expired` → refresh → `connect()`, because the client won't reconnect by itself after a server-side disconnect.
+
+---
+
+### Review checklist
+
+- [ ] Every socket handler validates its input as `unknown` and goes through `handle` (or something like it): no `async` listener without a `catch`.
+- [ ] Every room name comes from `rooms.ts`.
+- [ ] Events that every instance hears (queue events) use `io.local`; events that only one instance knows about (an HTTP request) use `io.to` / `fetchSockets`.
+- [ ] Anything only managers may see goes to `managersRoom`, never `clubRoom`.
+- [ ] Realtime side effects (`syncMembership`) run after the commit and never throw into the caller.
+- [ ] Emails are queued, never sent from the API process; anything that must not repeat has a deterministic `jobId`.
+- [ ] Every network client has explicit timeouts (Redis commands, enqueue, SMTP).
+- [ ] User text that ends up in a header (`Subject`, `Content-Disposition`) is flattened to one line first.
+
+### Known gaps and follow-ups
+
+| Gap | Why it's acceptable now | What would fix it |
+|---|---|---|
+| Events are at most once; nothing is replayed after a reconnect | Clients re-fetch over HTTP; events are hints | Persisted per-club event log with "since id" replay, or Socket.io connection-state recovery |
+| A "ready" email can be lost if the worker dies between the READY update and the enqueue | The video is still READY, listed and announced | Transactional outbox ([queues.md](queues.md#the-transactional-outbox-and-why-it-fits-here)) |
+| Reset and invitation links sit in Redis job data for up to 1 h (24 h if failed) | Tokens expire (30 min / 7 days); Redis is private | Treat Redis as sensitive; or put only ids in jobs |
+| Access tokens can't be revoked mid-connection (logout-all takes up to 15 min to reach sockets) | Same window as HTTP access tokens | Publish a "kick user" message on logout-all, handled by `userRoom` |
+| No rate limit on `club:join` | Each join is one indexed query; auth is required | A per-socket token bucket in `handle` |
+| Long polling needs sticky sessions behind a load balancer | No load balancer yet | Sticky sessions, or WebSocket-only transport |
+| Live demo GIF | Needs a screen recording | Record listener + upload side by side |
