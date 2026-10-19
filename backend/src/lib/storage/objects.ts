@@ -67,9 +67,15 @@ export const deletePrefix = async (bucket: string, prefix: string): Promise<numb
     );
     const objects = (page.Contents ?? []).flatMap((o) => (o.Key ? [{ Key: o.Key }] : []));
     if (objects.length > 0) {
-      await s3.send(
+      const { Errors } = await s3.send(
         new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects, Quiet: true } }),
       );
+      if (Errors && Errors.length > 0) {
+        const [first] = Errors;
+        throw new Error(
+          `Could not delete ${Errors.length} objects under ${bucket}/${prefix}: ${first?.Key} ${first?.Code}`,
+        );
+      }
       deleted += objects.length;
     }
     token = page.IsTruncated ? page.NextContinuationToken : undefined;

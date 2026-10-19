@@ -6,6 +6,7 @@ import { currentUser } from '../utils/current-user.js';
 import type {
   abortUploadSchemas,
   completeUploadSchemas,
+  deleteVideoSchemas,
   getVideoSchemas,
   initiateUploadSchemas,
   listVideosSchemas,
@@ -30,6 +31,12 @@ export const update: RequestHandler = async (req, res) => {
   const { params, body } = getInput<typeof updateVideoSchemas>(res);
   const result = await videoService.updateVideo(params.videoId, currentUser(req).id, body);
   res.json(result);
+};
+
+export const remove: RequestHandler = async (req, res) => {
+  const { params } = getInput<typeof deleteVideoSchemas>(res);
+  await videoService.deleteVideo(params.videoId, currentUser(req).id);
+  res.status(204).end();
 };
 
 export const initiateUpload: RequestHandler = async (req, res) => {

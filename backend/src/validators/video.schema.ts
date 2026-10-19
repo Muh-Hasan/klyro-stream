@@ -123,6 +123,10 @@ export const getVideoSchemas = {
   params: videoParams,
 };
 
+export const deleteVideoSchemas = {
+  params: videoParams,
+};
+
 export const updateVideoSchemas = {
   params: videoParams,
   body: z

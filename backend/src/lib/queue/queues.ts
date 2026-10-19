@@ -35,6 +35,9 @@ videoQueue.on('error', (err) => logger.error({ err, queue: VIDEO_QUEUE }, 'queue
 
 export const transcodeJobId = (videoId: string) => `video-${videoId}`;
 
+export const removeTranscodeJob = async (videoId: string) =>
+  (await videoQueue.remove(transcodeJobId(videoId))) === 1;
+
 export const enqueueTranscode = async (videoId: string, requestId?: string) => {
   const timeout = new AbortController();
   try {

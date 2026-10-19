@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { type ClubRole, type VideoStatus, videoStatusEnum } from '../lib/db/schema.js';
-import { enqueueTranscode, type TranscodeOutput } from '../lib/queue/queues.js';
+import { enqueueTranscode, removeTranscodeJob, type TranscodeOutput } from '../lib/queue/queues.js';
 import { BUCKETS } from '../lib/storage/client.js';
 import {
   abortUpload,
@@ -114,8 +114,10 @@ export const updateVideo = async (videoId: string, userId: string, input: Update
   return toVideoResponse({ ...updated, uploader: video.uploader });
 };
 
+const rawPrefix = (clubId: string, videoId: string) => `clubs/${clubId}/videos/${videoId}/`;
+
 const rawKey = (clubId: string, videoId: string, ext: string) =>
-  `clubs/${clubId}/videos/${videoId}/original.${ext}`;
+  `${rawPrefix(clubId, videoId)}original.${ext}`;
 
 export const initiateUpload = async (
   membership: Membership,
@@ -324,4 +326,30 @@ export const deleteVideoOutputs = async (videoId: string) => {
     deleteObject(BUCKETS.thumbnails, keys.thumbnailPath),
   ]);
   return segments;
+};
+
+export const deleteVideo = async (videoId: string, userId: string) => {
+  const { video, role } = await requireVisible(await videoRepo.findById(videoId), userId);
+  if (!canManage(video, role, userId)) {
+    throw new ForbiddenError('You do not have permission to delete this video');
+  }
+
+  if (video.status === 'UPLOADING') await abortLockedUpload(videoId, 'Video deleted');
+
+  if (!(await removeTranscodeJob(videoId))) {
+    throw new ConflictError(
+      'This video is being processed. Try again when processing finishes.',
+      'VIDEO_PROCESSING',
+    );
+  }
+
+  const [raw, outputs] = await Promise.all([
+    deletePrefix(BUCKETS.raw, rawPrefix(video.clubId, videoId)),
+    deleteVideoOutputs(videoId),
+  ]);
+  if (!(await videoRepo.remove(videoId))) throw videoNotFound();
+  logger.info(
+    { videoId, status: video.status, rawObjects: raw, hlsObjects: outputs },
+    'video deleted',
+  );
 };

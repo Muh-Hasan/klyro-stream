@@ -96,6 +96,11 @@ export const updateDetails = async (id: string, details: VideoDetails) => {
   return video;
 };
 
+export const remove = async (id: string) => {
+  const [deleted] = await db.delete(videos).where(eq(videos.id, id)).returning({ id: videos.id });
+  return deleted;
+};
+
 export const findByStatus = (status: VideoStatus, limit: number): Promise<Video[]> =>
   db.query.videos.findMany({
     where: eq(videos.status, status),

@@ -5,6 +5,7 @@ import { validate } from '../middleware/validate.middleware.js';
 import {
   abortUploadSchemas,
   completeUploadSchemas,
+  deleteVideoSchemas,
   getVideoSchemas,
   presignPartsSchemas,
   updateVideoSchemas,
@@ -17,6 +18,7 @@ videosRouter.use(requireAuth);
 
 videosRouter.get('/:videoId', validate(getVideoSchemas), videoController.get);
 videosRouter.patch('/:videoId', validate(updateVideoSchemas), videoController.update);
+videosRouter.delete('/:videoId', validate(deleteVideoSchemas), videoController.remove);
 
 videosRouter.post(
   '/:videoId/upload/parts',

@@ -1,0 +1,42 @@
+meta {
+  name: Delete video
+  type: http
+  seq: 10
+}
+
+delete {
+  url: {{baseUrl}}/videos/{{videoId}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+docs {
+  Deletes a video and everything it owns: the raw upload, every HLS playlist and segment, the thumbnail, any open multipart upload and any queued transcode job. Storage goes first and the row last, so a failure part-way can simply be retried.
+
+  Who: a club admin, or the uploader while they are still club_owner or admin. Same rule as editing.
+
+  | Status | Code | When |
+  |---|---|---|
+  | 204 | | deleted |
+  | 403 | `FORBIDDEN` | you can see the video but not manage it |
+  | 404 | `VIDEO_NOT_FOUND` | you can't see it, or it was already deleted |
+  | 409 | `VIDEO_PROCESSING` | a worker is transcoding it right now; retry when it finishes |
+
+  A video that is still `UPLOADING` can be deleted: the multipart upload is aborted first, and any part the client sends afterwards is refused by storage.
+
+  Example 409:
+
+  ```json
+  {
+    "error": {
+      "code": "VIDEO_PROCESSING",
+      "message": "This video is being processed. Try again when processing finishes."
+    },
+    "requestId": "c60b3960-517e-4b49-8d08-9b0309bfc1a4"
+  }
+  ```
+}
