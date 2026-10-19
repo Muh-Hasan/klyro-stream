@@ -1,4 +1,6 @@
 import type { Server as HttpServer } from 'node:http';
+import { createAdapter } from '@socket.io/redis-adapter';
+import { Redis } from 'ioredis';
 import { Server, type Socket } from 'socket.io';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
@@ -20,6 +22,15 @@ type RealtimeSocket = Socket<
 >;
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
+
+const adapterClients: Redis[] = [];
+
+const adapterClient = (name: string) => {
+  const client = new Redis(env.REDIS_URL, { connectionName: `klyro:sockets-${name}` });
+  client.on('error', (err) => logger.error({ err, client: name }, 'socket adapter redis error'));
+  adapterClients.push(client);
+  return client;
+};
 
 const unauthorized = (message: string) =>
   Object.assign(new Error(message), { data: { code: 'UNAUTHORIZED' } });
@@ -64,6 +75,7 @@ export const createRealtime = (httpServer: HttpServer): RealtimeServer => {
   const io: RealtimeServer = new Server(httpServer, {
     cors: { origin: env.FRONTEND_URL },
     maxHttpBufferSize: MAX_MESSAGE_BYTES,
+    adapter: createAdapter(adapterClient('pub'), adapterClient('sub')),
   });
   io.use(authenticate);
   io.on('connection', onConnection);
@@ -74,4 +86,5 @@ export const createRealtime = (httpServer: HttpServer): RealtimeServer => {
 export const closeRealtime = async (io: RealtimeServer) => {
   setRealtime(undefined);
   await io.close();
+  await Promise.all(adapterClients.splice(0).map((client) => client.quit()));
 };
