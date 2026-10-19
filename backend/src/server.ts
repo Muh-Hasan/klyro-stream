@@ -12,6 +12,7 @@ import { env } from './config/env.js';
 import { closeDb } from './lib/db/client.js';
 import { closeMailer } from './lib/mail/mailer.js';
 import { closeQueueConnections } from './lib/queue/connection.js';
+import { createRealtime } from './lib/realtime/socket.js';
 import { closeQueues } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
 import { logger } from './utils/logger.js';
@@ -21,6 +22,8 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
 const server: Server = createApp().listen(env.PORT, () => {
   logger.info({ port: env.PORT }, 'API listening');
 });
+
+const realtime = createRealtime(server);
 
 let shuttingDown = false;
 
@@ -35,10 +38,9 @@ const shutdown = async (reason: string, exitCode = 0) => {
   }, SHUTDOWN_TIMEOUT_MS);
   forceExit.unref();
 
-  await new Promise<void>((resolve) => {
-    server.close(() => resolve());
-    server.closeIdleConnections(); // drop idle keep-alive sockets now; busy ones finish first
-  });
+  const closing = realtime.close();
+  server.closeIdleConnections(); // drop idle keep-alive sockets now; busy ones finish first
+  await closing;
 
   closeMailer();
   const results = await Promise.allSettled([

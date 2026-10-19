@@ -27,6 +27,12 @@ const verify = (token: string, secret: string): VerifiedPayload => {
 export const verifyAccessToken = (token: string): string =>
   verify(token, env.JWT_ACCESS_SECRET).sub;
 
+export const readAccessToken = (token: string): { userId: string; expiresAt: number } => {
+  const { sub, exp } = verify(token, env.JWT_ACCESS_SECRET);
+  if (!exp) throw new Error('Access token has no expiry');
+  return { userId: sub, expiresAt: exp * 1000 };
+};
+
 export const verifyRefreshToken = (token: string): RefreshPayload => {
   const { sub, jti, exp, ver: rawVer } = verify(token, env.JWT_REFRESH_SECRET);
   const ver: unknown = rawVer;
