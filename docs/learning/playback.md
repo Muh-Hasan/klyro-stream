@@ -13,8 +13,9 @@ Related: [indexes.md](indexes.md) (how B-tree indexes work) · [transactions.md]
 5. [Presigned GET URLs](#5-presigned-get-urls)
 6. [Stage 1 code: the list endpoint](#6-stage-1-code-the-list-endpoint)
 7. [Stages 2–3: one video, viewing and editing](#7-stages-23-one-video-viewing-and-editing)
+8. [Stage 4: deleting a video](#8-stage-4-deleting-a-video)
 
-Coming in later stages: delete, signed HLS streaming, atomic download quotas.
+Coming in later stages: signed HLS streaming, atomic download quotas.
 
 ---
 
@@ -449,3 +450,101 @@ PATCH {"title":"","description":5}  → { body: { title: [...], description: [..
 | admin PATCH both fields, `""` description, title only | 200; trimmed; cleared; `updatedAt` changes each time |
 | `{}`, `[]`, blank title | 400 with a message |
 | `{"status":"READY","title":"x"}` | only the title changed |
+
+---
+
+## 8. Stage 4: deleting a video
+
+```text
+DELETE /videos/:videoId   → 204 No Content
+                          → 403 FORBIDDEN          can see it, can't manage it (same rule as PATCH)
+                          → 404 VIDEO_NOT_FOUND    can't see it, or it's already gone
+                          → 409 VIDEO_PROCESSING   a worker is transcoding it right now
+```
+
+A video is spread over **four places**: one Postgres row, the raw upload in `raw-uploads`, the HLS playlists and segments in `hls-output`, and the thumbnail in `thumbnails`. A fifth exists while things are in flight: an open multipart upload, or a transcode job in Redis. Deleting the row is easy. Getting rid of everything else without leaving **orphans** (objects nothing points to, which you pay to store forever) is the real work.
+
+### The order: everything else first, the row last
+
+```mermaid
+flowchart TD
+    D["DELETE /videos/:id"] --> G["requireVisible + canManage<br/>(404 / 403 as in Stage 3)"]
+    G --> U{"status UPLOADING?"}
+    U -- yes --> A["lock the row, abort the multipart upload,<br/>move it to ERROR"]
+    U -- no --> J
+    A --> J{"remove the transcode job<br/>(atomic in Redis)"}
+    J -- "locked by a worker" --> C["409 VIDEO_PROCESSING"]
+    J -- "removed, or none" --> S["delete raw prefix, HLS prefix, thumbnail<br/>(1,000 keys per call)"]
+    S --> R["DELETE the row"] --> OK["204"]
+```
+
+Why the row goes **last**: if storage cleanup fails halfway, the row still exists and still points at what's left. The request returns 500 and the client can simply send `DELETE` again; every step is safe to repeat (deleting a missing key succeeds, removing a missing job succeeds). The other order, row first, would leave objects that nothing references and nobody can find again.
+
+### Each status needs something different
+
+| Status | What could still be running | What delete does |
+|---|---|---|
+| `UPLOADING` | the client is still sending parts | takes the row lock (`SELECT … FOR UPDATE`, the same `withUploadLock` that `complete` uses), aborts the multipart upload, moves the row to `ERROR`, then carries on |
+| `PROCESSING`, job waiting or delayed | nothing yet; the job is queued | removes the job so no worker ever starts it |
+| `PROCESSING`, job active | FFmpeg, writing segments | **409**. Deleting now would race the worker: it would upload outputs after our cleanup, and they'd be orphans |
+| `READY` / `ERROR` | nothing | removes the leftover completed or failed job (so Bull Board doesn't show a job for a video that no longer exists) |
+
+**Why lock for `UPLOADING`?** Without the lock, `complete` could run between our abort and our row delete: it would assemble the object and enqueue a transcode for a video that's being deleted. With the lock, the two serialize. If `complete` wins, the row is `PROCESSING` when we get the lock, `abortLockedUpload` finds nothing to do, and the job check below handles it. If delete wins, `complete` waits, then finds no `UPLOADING` row and returns 404.
+
+### Removing the job without a race
+
+The obvious code has a gap:
+
+```ts
+const job = await videoQueue.getJob(id);
+if ((await job.getState()) === 'active') throw conflict();   // ← a worker can take the job right here
+await job.remove();
+```
+
+BullMQ's `Queue.remove(jobId)` is a Lua script that runs inside Redis in one step: "if no worker holds the lock, delete the job". It returns `1` (removed, or there was nothing to remove) or `0` (a worker holds the lock). The check and the delete can't be split by a worker, so there's no gap:
+
+```ts
+export const removeTranscodeJob = async (videoId: string) =>
+  (await videoQueue.remove(transcodeJobId(videoId))) === 1;
+```
+
+This is the same idea as the quota update in Stage 6: **make the check and the change one atomic operation**, here in Redis, there in Postgres.
+
+### Deleting a "folder" in S3
+
+S3 has no folders, only keys that share a prefix. `deletePrefix` (written in Sprint 6, see [transcoding.md](transcoding.md)) lists 1,000 keys at a time with `ListObjectsV2` and deletes each page with one `DeleteObjects` call, which also takes at most 1,000 keys. Stage 4 fixed one gap in it: `DeleteObjects` returns **200 even when some keys fail**, listing them in `Errors`. The old code ignored that array. Now it throws, so a partial failure surfaces as a 500 and the row survives for a retry:
+
+```ts
+const { Errors } = await s3.send(new DeleteObjectsCommand({ Bucket, Delete: { Objects, Quiet: true } }));
+if (Errors && Errors.length > 0) throw new Error(`Could not delete ${Errors.length} objects ...`);
+```
+
+`Quiet: true` means "only tell me about failures", so a successful batch returns an almost empty body.
+
+The three prefixes:
+
+| Bucket | Prefix or key |
+|---|---|
+| `raw-uploads` | `clubs/<clubId>/videos/<videoId>/` |
+| `hls-output` | `<videoId>/` |
+| `thumbnails` | `<videoId>.jpg` |
+
+The raw delete uses the **prefix**, not `raw_path`, so anything under that video's folder goes, whatever its file extension.
+
+### Known limits
+
+- **Delete runs inside the request.** 2,500 objects took **8.2 s** against local RustFS: three list calls and three `DeleteObjects` calls, each waiting on the one before. A 2-hour video has ~3,600 segments across its renditions, so that's fine for now, but a platform with 10-hour videos would mark the row `DELETING`, return `202 Accepted`, and let a queue job do the cleanup with retries.
+- **`requeue-stuck` could race a delete.** If the operator script re-enqueues a stuck `PROCESSING` video in the moment between our job removal and our row delete, a job is created for a video that then disappears. The worker loads the row, finds nothing, and fails the job as `UnrecoverableError('Video not found')` without retrying. That's harmless, just noise in Bull Board.
+- **Download history.** Until Stage 6, `download_logs.video_id` is `ON DELETE CASCADE`, so deleting a video erases its download history. Stage 6 changes that.
+
+### What was tested
+
+| Case | Result |
+|---|---|
+| `not-a-uuid` / unknown id / no token | 400 / 404 `VIDEO_NOT_FOUND` / 401 |
+| viewer deletes READY / ERROR | 403 / 404 |
+| admin deletes a READY stub with **2,500** HLS objects + raw + thumbnail | 204 in 8.2 s; 0 objects left in all three buckets; row gone; GET and a second DELETE → 404 |
+| delete while `UPLOADING` (part 1 of 2 sent) | 204; `ListMultipartUploads` empty; a late part `PUT` → 404 from storage; `complete` → 404 `UPLOAD_NOT_FOUND` |
+| real 720p upload → READY → delete | resolution saved as 1280×720; 1 raw + 7 HLS + 1 thumbnail before, 0 after; completed job removed |
+| 90 s 1080p upload, delete while the job is **active** | 409 `VIDEO_PROCESSING`; row stays `PROCESSING`; transcode finishes normally (49 HLS objects); delete then → 204, 0 left |
+| queue paused, delete while the job is **waiting** | 204; job gone from Redis; 0 objects; queue resumed with nothing stuck |
