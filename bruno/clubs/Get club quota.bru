@@ -1,0 +1,36 @@
+meta {
+  name: Get club quota
+  type: http
+  seq: 12
+}
+
+get {
+  url: {{baseUrl}}/clubs/{{clubId}}/quota
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+docs {
+  Any member. How many downloads the club may make and how many it has used. `remaining` never goes below 0, even when an operator lowers the limit below what's already been used.
+
+  Clubs you are not in return 404 `CLUB_NOT_FOUND`. A club admin **cannot** change the limit: that's an operator action (`PATCH /admin/clubs/:clubId/quota`, Basic auth), so a club can't grant itself more downloads.
+
+  Example response:
+
+  ```json
+  {
+    "quota": {
+      "limit": 100,
+      "used": 3,
+      "remaining": 97,
+      "updatedAt": "2026-10-19T10:53:10.735Z"
+    }
+  }
+  ```
+
+  The count never resets; it covers the club's whole lifetime.
+}

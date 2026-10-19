@@ -2,6 +2,7 @@ import { Router } from 'express';
 import * as clubController from '../controllers/club.controller.js';
 import * as invitationController from '../controllers/invitation.controller.js';
 import * as memberController from '../controllers/member.controller.js';
+import * as quotaController from '../controllers/quota.controller.js';
 import * as videoController from '../controllers/video.controller.js';
 import { requireAuth } from '../middleware/require-auth.middleware.js';
 import { requireClubRole } from '../middleware/require-club-role.middleware.js';
@@ -23,6 +24,7 @@ import {
   removeMemberSchemas,
   updateMemberSchemas,
 } from '../validators/member.schema.js';
+import { getQuotaSchemas } from '../validators/quota.schema.js';
 import { initiateUploadSchemas, listVideosSchemas } from '../validators/video.schema.js';
 
 export const clubsRouter = Router();
@@ -99,4 +101,11 @@ clubsRouter.post(
   validate(initiateUploadSchemas),
   requireClubRole('club_owner'),
   videoController.initiateUpload,
+);
+
+clubsRouter.get(
+  '/:clubId/quota',
+  validate(getQuotaSchemas),
+  requireClubRole('viewer'),
+  quotaController.get,
 );

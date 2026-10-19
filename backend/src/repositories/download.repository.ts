@@ -1,6 +1,6 @@
 import { and, eq, lt, sql } from 'drizzle-orm';
 import { db } from '../lib/db/client.js';
-import { downloadLogs, downloadQuotas } from '../lib/db/schema.js';
+import { type DownloadQuota, downloadLogs, downloadQuotas } from '../lib/db/schema.js';
 
 export type DownloadRecord = { clubId: string; videoId: string; userId: string };
 
@@ -21,3 +21,15 @@ export const consumeQuotaAndLog = (record: DownloadRecord) =>
     await tx.insert(downloadLogs).values(record);
     return quota;
   });
+
+export const findQuota = (clubId: string): Promise<DownloadQuota | undefined> =>
+  db.query.downloadQuotas.findFirst({ where: eq(downloadQuotas.clubId, clubId) });
+
+export const setQuotaLimit = async (clubId: string, limit: number) => {
+  const [quota] = await db
+    .update(downloadQuotas)
+    .set({ quotaLimit: limit })
+    .where(eq(downloadQuotas.clubId, clubId))
+    .returning();
+  return quota;
+};

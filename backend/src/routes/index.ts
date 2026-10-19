@@ -3,7 +3,7 @@
  * Reading this file should tell you every top-level path the service exposes.
  */
 import { Router } from 'express';
-import { adminRouter, BULL_BOARD_PATH } from './admin.routes.js';
+import { ADMIN_PATH, adminRouter } from './admin.routes.js';
 import { authRouter } from './auth.routes.js';
 import { clubsRouter } from './clubs.routes.js';
 import { healthRouter } from './health.routes.js';
@@ -18,4 +18,4 @@ routes.use('/clubs', clubsRouter);
 routes.use('/invitations', invitationsRouter);
 routes.use('/videos', videosRouter);
 
-if (adminRouter) routes.use(BULL_BOARD_PATH, adminRouter);
+if (adminRouter) routes.use(ADMIN_PATH, adminRouter);

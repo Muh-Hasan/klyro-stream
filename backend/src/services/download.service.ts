@@ -5,6 +5,7 @@ import { presignGet } from '../lib/storage/objects.js';
 import * as downloadRepo from '../repositories/download.repository.js';
 import * as videoRepo from '../repositories/video.repository.js';
 import { ConflictError, ForbiddenError, NotFoundError } from '../utils/errors.js';
+import { toQuota } from './quota.service.js';
 import { requireVisible } from './video.service.js';
 
 export const DOWNLOAD_URL_TTL_SECONDS = 300;
@@ -72,6 +73,6 @@ export const createDownload = async (videoId: string, userId: string) => {
       sizeBytes,
       expiresAt: new Date(Date.now() + DOWNLOAD_URL_TTL_SECONDS * 1000),
     },
-    quota: { limit: quota.limit, used: quota.used, remaining: quota.limit - quota.used },
+    quota: toQuota(quota),
   };
 };

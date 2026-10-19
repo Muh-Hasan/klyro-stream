@@ -1,0 +1,54 @@
+meta {
+  name: Set club quota
+  type: http
+  seq: 2
+}
+
+patch {
+  url: {{baseUrl}}/admin/clubs/{{clubId}}/quota
+  body: json
+  auth: basic
+}
+
+auth:basic {
+  username: {{bullBoardUser}}
+  password: {{bullBoardPassword}}
+}
+
+body:json {
+  {
+    "limit": 250
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.quota.limit: eq 250
+}
+
+docs {
+  Operator only. Uses the same Basic auth as Bull Board (`BULL_BOARD_USER` / `BULL_BOARD_PASSWORD`), which now guards everything under `/admin`. A Bearer token, even a club admin's, gets 401.
+
+  `limit` is a whole number from 0 to 1,000,000. Setting it below `used` is allowed and simply stops further downloads (`remaining: 0`). `used` is never changed here.
+
+  | Status | Code | When |
+  |---|---|---|
+  | 200 | | limit changed |
+  | 400 | `VALIDATION_ERROR` | `limit` missing, negative, fractional, a string, or too big |
+  | 401 | `UNAUTHORIZED` | missing or wrong credentials |
+  | 404 | `CLUB_NOT_FOUND` | no such club |
+  | 429 | `RATE_LIMITED` | 10 wrong passwords in 15 minutes (only 401s count) |
+
+  Example response:
+
+  ```json
+  {
+    "quota": {
+      "limit": 250,
+      "used": 0,
+      "remaining": 250,
+      "updatedAt": "2026-10-19T10:53:10.735Z"
+    }
+  }
+  ```
+}
