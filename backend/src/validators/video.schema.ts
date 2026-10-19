@@ -127,6 +127,15 @@ export const deleteVideoSchemas = {
   params: videoParams,
 };
 
+export const streamSchemas = {
+  params: videoParams.extend({
+    rendition: z.union([
+      z.literal('master'),
+      z.string().regex(/^\d{3,4}p$/, 'Expected master or a rendition such as 720p'),
+    ]),
+  }),
+};
+
 export const updateVideoSchemas = {
   params: videoParams,
   body: z

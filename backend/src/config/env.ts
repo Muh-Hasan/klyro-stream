@@ -43,6 +43,7 @@ const schema = z.object({
   S3_REGION: z.string().default('us-east-1'),
   S3_ACCESS_KEY: z.string().min(1),
   S3_SECRET_KEY: z.string().min(1),
+  STREAM_URL_TTL_SECONDS: z.coerce.number().int().min(10).max(3600).default(300),
 
   BULL_BOARD_USER: optional(z.string()),
   BULL_BOARD_PASSWORD: optional(z.string().min(12)),

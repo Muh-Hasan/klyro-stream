@@ -1,0 +1,38 @@
+meta {
+  name: Stream master playlist
+  type: http
+  seq: 11
+}
+
+get {
+  url: {{baseUrl}}/videos/{{videoId}}/stream/master.m3u8
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+docs {
+  The entry point for a player. Any member who can see the video, READY only (409 `VIDEO_NOT_READY` otherwise). The variant lines are rewritten to **relative** API routes, so the player requests each rendition through the API too, with the same Bearer token.
+
+  `Content-Type: application/vnd.apple.mpegurl` · `Cache-Control: no-store`
+
+  Example response:
+
+  ```text
+  #EXTM3U
+  #EXT-X-VERSION:6
+  #EXT-X-STREAM-INF:BANDWIDTH=5640800,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
+  1080p.m3u8
+
+  #EXT-X-STREAM-INF:BANDWIDTH=3220800,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"
+  720p.m3u8
+
+  #EXT-X-STREAM-INF:BANDWIDTH=1645600,RESOLUTION=854x480,CODECS="avc1.64001e,mp4a.40.2"
+  480p.m3u8
+  ```
+
+  In a browser, hls.js adds the token with `xhrSetup`, but only for URLs on the API. Segment URLs already carry a signature. Try it with `npm run videos:play` and the "play through the API" link.
+}

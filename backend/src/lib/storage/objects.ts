@@ -92,5 +92,11 @@ export const openObject = async (bucket: string, key: string, signal?: AbortSign
   return { body: Body, contentType: ContentType, contentLength: ContentLength };
 };
 
+export const readText = async (bucket: string, key: string): Promise<string> => {
+  const { Body } = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  if (!Body) throw new Error(`GetObject ${key} returned no body`);
+  return Body.transformToString();
+};
+
 export const presignGet = (bucket: string, key: string, expiresIn: number): Promise<string> =>
   getSignedUrl(s3Public, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn });

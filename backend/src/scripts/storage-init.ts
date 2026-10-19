@@ -22,7 +22,7 @@ const ensureBucket = async (bucket: string) => {
   }
 };
 
-const allowBrowserUploads = async (bucket: string) => {
+const allowBrowser = async (bucket: string, methods: string[]) => {
   await s3.send(
     new PutBucketCorsCommand({
       Bucket: bucket,
@@ -30,7 +30,7 @@ const allowBrowserUploads = async (bucket: string) => {
         CORSRules: [
           {
             AllowedOrigins: env.FRONTEND_URL,
-            AllowedMethods: ['PUT', 'GET'],
+            AllowedMethods: methods,
             AllowedHeaders: ['*'],
             ExposeHeaders: ['ETag'],
             MaxAgeSeconds: 3600,
@@ -39,12 +39,13 @@ const allowBrowserUploads = async (bucket: string) => {
       },
     }),
   );
-  logger.info({ bucket, origins: env.FRONTEND_URL }, 'cors applied');
+  logger.info({ bucket, methods, origins: env.FRONTEND_URL }, 'cors applied');
 };
 
 try {
   for (const bucket of Object.values(BUCKETS)) await ensureBucket(bucket);
-  await allowBrowserUploads(BUCKETS.raw);
+  await allowBrowser(BUCKETS.raw, ['PUT', 'GET']);
+  await allowBrowser(BUCKETS.hls, ['GET']);
   logger.info('storage ready');
 } catch (err) {
   logger.error({ err }, 'storage init failed');

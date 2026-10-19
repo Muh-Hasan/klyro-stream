@@ -63,9 +63,9 @@ export const listVideos = async (
   return paginated(withThumbnails, total, page, limit);
 };
 
-const videoNotFound = () => new NotFoundError('Video not found', 'VIDEO_NOT_FOUND');
+export const videoNotFound = () => new NotFoundError('Video not found', 'VIDEO_NOT_FOUND');
 
-const requireVisible = async <T extends Pick<Video, 'clubId' | 'status'>>(
+export const requireVisible = async <T extends Pick<Video, 'clubId' | 'status'>>(
   video: T | undefined,
   userId: string,
 ) => {

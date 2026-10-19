@@ -10,7 +10,11 @@ import * as videoRepo from '../repositories/video.repository.js';
 import { logger } from '../utils/logger.js';
 
 const { values } = parseArgs({
-  options: { port: { type: 'string', default: '4100' }, kbps: { type: 'string', default: '0' } },
+  options: {
+    port: { type: 'string', default: '4100' },
+    kbps: { type: 'string', default: '0' },
+    api: { type: 'string', default: 'http://localhost:4000' },
+  },
 });
 const port = Number(values.port);
 let kbps = Number(values.kbps);
@@ -20,6 +24,7 @@ const HLS_ROUTE = new RegExp(`^/hls/(${UUID})/((?:[\\w-]+/)?[\\w-]+\\.(?:m3u8|ts
 const THUMB_ROUTE = new RegExp(`^/thumb/(${UUID})\\.jpg$`);
 const WATCH_ROUTE = new RegExp(`^/watch/(${UUID})$`);
 const SPEEDS = [0, 8000, 3000, 1500, 800];
+const LOCAL_ORIGIN = /^http:\/\/localhost:\d{2,5}$/;
 
 const escapeHtml = (text: string) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
@@ -50,8 +55,9 @@ const listPage = async () => {
   const videos = (await videoRepo.findByStatus('READY', 50)).filter((v) => v.hlsPath);
   const cards = videos
     .map(
-      (v) => `<a class="card" href="/watch/${v.id}"><img src="/thumb/${v.id}.jpg" alt="">
-<div>${escapeHtml(v.title)} · ${v.durationSeconds ?? '?'} s</div></a>`,
+      (v) => `<div class="card"><a href="/watch/${v.id}"><img src="/thumb/${v.id}.jpg" alt="">
+<div>${escapeHtml(v.title)} · ${v.durationSeconds ?? '?'} s</div></a>
+<a href="/watch/${v.id}?api=${encodeURIComponent(values.api)}">play through the API</a></div>`,
     )
     .join('');
   return page(
@@ -60,10 +66,16 @@ const listPage = async () => {
   );
 };
 
-const watchPage = (videoId: string, title: string) =>
+const watchPage = (videoId: string, title: string, api: string | null) =>
   page(
     title,
     `<p><a href="/">← all videos</a></p><h1>${escapeHtml(title)}</h1>
+${
+  api
+    ? `<div class="bar">API mode: ${escapeHtml(api)} · access token
+<input id="token" type="password" size="40" autocomplete="off"><button id="play">Play</button></div>`
+    : ''
+}
 <video id="v" controls muted autoplay playsinline></video>
 <div class="bar">Quality: <span class="stat" id="level">–</span> · estimate <span class="stat" id="bw">–</span></div>
 <div class="bar" id="levels"><button data-level="-1" class="on">Auto</button></div>
@@ -83,11 +95,53 @@ const log = (msg) => {
 };
 const mark = (bar, attr, value) =>
   bar.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset[attr] === String(value)));
-const hls = new Hls();
+const API = ${JSON.stringify(api)};
+const src = API ? API + '/videos/${videoId}/stream/master.m3u8' : '/hls/${videoId}/master.m3u8';
+const tokenBox = document.getElementById('token');
+const bearer = () => 'Bearer ' + tokenBox.value.trim();
+const fragPolicy = Hls.DefaultConfig.fragLoadPolicy.default;
+const hls = new Hls({
+  xhrSetup: (xhr, url) => {
+    if (API && url.startsWith(API + '/')) xhr.setRequestHeader('Authorization', bearer());
+  },
+  fragLoadPolicy: {
+    default: {
+      ...fragPolicy,
+      errorRetry: {
+        ...fragPolicy.errorRetry,
+        retryDelayMs: 300,
+        shouldRetry: (config, count, timeout, response, retry) =>
+          retry || Boolean(API && response && response.code === 403 && count < 3),
+      },
+    },
+  },
+});
 window.hls = hls;
-hls.loadSource('/hls/${videoId}/master.m3u8');
-hls.attachMedia(video);
+const start = () => {
+  hls.loadSource(src);
+  hls.attachMedia(video);
+};
+if (API) document.getElementById('play').addEventListener('click', start);
+else start();
+const refreshing = new Map();
+const refreshSegmentUrls = (index) => {
+  if (refreshing.has(index)) return;
+  const level = hls.levels[index];
+  const job = fetch(level.uri, { headers: { Authorization: bearer() } })
+    .then((res) => (res.ok ? res.text() : Promise.reject(new Error('playlist ' + res.status))))
+    .then((text) => {
+      const urls = text.split('\\n').filter((line) => line && !line.startsWith('#'));
+      level.details.fragments.forEach((frag, i) => (frag.url = urls[i]));
+      log('fresh segment URLs for ' + level.height + 'p (' + urls.length + ' segments)');
+    })
+    .catch((err) => log('could not refresh ' + level.height + 'p: ' + err.message))
+    .finally(() => refreshing.delete(index));
+  refreshing.set(index, job);
+};
+let levelsShown = false;
 hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+  if (levelsShown) return;
+  levelsShown = true;
   const bar = document.getElementById('levels');
   data.levels.forEach((l, i) => {
     const b = document.createElement('button');
@@ -108,7 +162,13 @@ hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
   log('segment ' + data.frag.sn + ' @ ' + hls.levels[data.frag.level].height + 'p, ' +
     (data.frag.stats.total / 1e6).toFixed(2) + ' MB in ' + Math.round(ms) + ' ms');
 });
-hls.on(Hls.Events.ERROR, (_, data) => log('error: ' + data.details + (data.fatal ? ' (fatal)' : '')));
+hls.on(Hls.Events.ERROR, (_, data) => {
+  const status = data.response && data.response.code;
+  log('error: ' + data.details + (status ? ' ' + status : '') + (data.fatal ? ' (fatal)' : ''));
+  if (API && data.details === Hls.ErrorDetails.FRAG_LOAD_ERROR && status === 403) {
+    refreshSegmentUrls(data.frag.level);
+  }
+});
 document.getElementById('levels').addEventListener('click', (e) => {
   const level = e.target.dataset && e.target.dataset.level;
   if (level === undefined) return;
@@ -170,9 +230,10 @@ const route = async (req: IncomingMessage, res: ServerResponse) => {
       res.writeHead(404).end('Video not found or not READY');
       return;
     }
+    const api = url.searchParams.get('api');
     res
       .writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      .end(watchPage(video.id, video.title));
+      .end(watchPage(video.id, video.title, api && LOCAL_ORIGIN.test(api) ? api : null));
     return;
   }
 

@@ -1,0 +1,44 @@
+meta {
+  name: Stream variant playlist
+  type: http
+  seq: 12
+}
+
+get {
+  url: {{baseUrl}}/videos/{{videoId}}/stream/{{rendition}}.m3u8
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+vars:pre-request {
+  rendition: 720p
+}
+
+docs {
+  One rendition's playlist. Every segment line is replaced by a presigned GET URL that storage honours for `STREAM_URL_TTL_SECONDS` (default 300). After that the same URL returns 403 `AccessDenied`, so a copied link stops working within 5 minutes.
+
+  `rendition` must be `master` or match `^\d{3,4}p$`. Anything else, including `..%2Fsecret`, is a 400. A rendition the video doesn't have is a 404 `RENDITION_NOT_FOUND`.
+
+  Example response (shortened):
+
+  ```text
+  #EXTM3U
+  #EXT-X-VERSION:6
+  #EXT-X-TARGETDURATION:6
+  #EXT-X-MEDIA-SEQUENCE:0
+  #EXT-X-PLAYLIST-TYPE:VOD
+  #EXT-X-INDEPENDENT-SEGMENTS
+  #EXTINF:6.000000,
+  http://localhost:9000/hls-output/4dce8038-.../720p/seg_000.ts?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=300&X-Amz-Signature=...
+  #EXTINF:6.000000,
+  http://localhost:9000/hls-output/4dce8038-.../720p/seg_001.ts?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=300&X-Amz-Signature=...
+  ...
+  #EXT-X-ENDLIST
+  ```
+
+  A VOD playlist is read once, so a player that keeps going past the TTL must fetch this playlist again when a segment returns 403. The dev player does exactly that.
+}
