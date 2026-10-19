@@ -29,11 +29,12 @@ class RecoveringRedisStore extends RedisStore {
   }
 }
 
-const limiter = (name: string, limit: number, windowMs: number, countFailuresOnly = false) =>
+const limiter = (name: string, limit: number, windowMs: number, authFailuresOnly = false) =>
   rateLimit({
     windowMs,
     limit,
-    skipSuccessfulRequests: countFailuresOnly,
+    skipSuccessfulRequests: authFailuresOnly,
+    requestWasSuccessful: (_req, res) => res.statusCode !== 401,
     standardHeaders: 'draft-8',
     legacyHeaders: false,
     passOnStoreError: true,

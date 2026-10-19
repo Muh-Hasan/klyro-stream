@@ -909,7 +909,7 @@ The stalled path at the bottom is still the safety net for a crash, `kill -9`, o
 
 - Mounted in the **API** (`src/routes/admin.routes.ts`), and only when `BULL_BOARD_USER` and `BULL_BOARD_PASSWORD` (at least 12 characters) are both set.
 - HTTP basic auth (`basic-auth.middleware.ts`): both sides are SHA-256 hashed, then compared with `timingSafeEqual`, and the user and password are always both checked, so response time leaks nothing.
-- `adminLimiter`: 10 **failed** requests per 15 min per IP (`skipSuccessfulRequests`), because the dashboard itself polls every few seconds. It runs before auth, so a locked-out IP can't keep guessing.
+- `adminLimiter`: 10 **rejected logins (401s)** per 15 min per IP (`skipSuccessfulRequests` with `requestWasSuccessful: status !== 401`). Only 401s count, because the dashboard polls every few seconds, and since Sprint 7 the same `/admin` area serves the quota endpoint, where a typo gives a 400 that mustn't lock the operator out. It runs before auth, so a locked-out IP can't keep guessing.
 - Its polling `GET`s are kept out of the request log; actions (retry, clean, promote) are logged.
 - **Retry in Bull Board re-runs the job, not the video.** Retrying the job of an ERROR video fails at once with "Video is ERROR, expected PROCESSING". Bringing a failed video back needs an explicit `ERROR → PROCESSING` decision in the app.
 
