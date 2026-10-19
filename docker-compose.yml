@@ -73,7 +73,95 @@ services:
       rustfs:
         condition: service_healthy
 
+  api:
+    build:
+      context: ./backend
+      target: api
+    profiles: [api]
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+    env_file: ./backend/.env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://klyro:klyro_dev@postgres:5432/klyro
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://rustfs:9000
+      SMTP_HOST: mailpit
+      SMTP_PORT: '1025'
+    ports: ['4000:4000']
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports: ['9090:9090']
+    mem_limit: 512m
+
+  loki:
+    image: grafana/loki:3.5.3
+    profiles: [observability]
+    restart: unless-stopped
+    command: ['-config.file=/etc/loki/config.yml']
+    volumes:
+      - ./docker/loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    mem_limit: 512m
+
+  alloy:
+    image: grafana/alloy:v1.10.2
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./docker/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports: ['12345:12345']
+    depends_on: [loki]
+    mem_limit: 256m
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    profiles: [observability]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/klyro.json
+      GF_SMTP_ENABLED: 'true'
+      GF_SMTP_HOST: mailpit:1025
+      GF_SMTP_FROM_ADDRESS: alerts@klyro.local
+      GF_SMTP_FROM_NAME: KlyroStream alerts
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports: ['3000:3000']
+    depends_on: [prometheus, loki]
+    mem_limit: 512m
+
 volumes:
   postgres_data:
   redis_data:
   rustfs_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:

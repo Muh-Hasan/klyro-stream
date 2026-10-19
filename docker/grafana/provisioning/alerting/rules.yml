@@ -1,0 +1,41 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: api
+    folder: KlyroStream
+    interval: 30s
+    rules:
+      - uid: api-error-rate
+        title: API error rate above 5%
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: page
+        annotations:
+          summary: More than 5% of API requests failed with a 5xx over the last 2 minutes
+          description: 'Error ratio {{ humanizePercentage $values.A.Value }} over the last 2 minutes (at least 20 requests in the window).'
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                (sum(rate(http_requests_total{status=~"5.."}[2m])) / sum(rate(http_requests_total[2m])))
+                and on() (sum(increase(http_requests_total[2m])) >= 20)
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0.05]
