@@ -6,6 +6,7 @@ import { env } from '../config/env.js';
 import type { TranscodeJob, TranscodeOutput } from '../lib/queue/queues.js';
 import { BUCKETS } from '../lib/storage/client.js';
 import * as videoRepo from '../repositories/video.repository.js';
+import { notifyVideoFailed, notifyVideoReady } from '../services/notification.service.js';
 import * as videoService from '../services/video.service.js';
 import { type Logger, logger } from '../utils/logger.js';
 import { downloadSource } from './pipeline/download.js';
@@ -134,6 +135,7 @@ const transcode = async (job: Job<TranscodeJob>, log: Logger) => {
 
   const ready = await videoService.markVideoReady(videoId, output);
   if (!ready) throw new UnrecoverableError('Video left PROCESSING while it was being processed');
+  await notifyVideoReady(videoId);
 
   log.info('processing complete');
   return { status: ready.status, ...output };
@@ -152,6 +154,7 @@ const failForGood = async (job: Job<TranscodeJob>, err: unknown, log: Logger) =>
 
   let deletedOutputs: number | undefined;
   if (failed) {
+    await notifyVideoFailed(videoId);
     deletedOutputs = await videoService.deleteVideoOutputs(videoId).catch((cleanErr: unknown) => {
       log.error({ err: cleanErr }, 'could not delete partial outputs');
       return undefined;

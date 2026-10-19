@@ -32,6 +32,7 @@ const schema = z.object({
   MAIL_FROM: z.string().default('KlyroStream <no-reply@klyro.local>'),
   PASSWORD_RESET_URL: z.url(),
   INVITE_URL: z.url(),
+  VIDEO_URL: z.url().default('http://localhost:5173/videos'),
 
   GOOGLE_CLIENT_ID: z.string().min(1),
   GOOGLE_CLIENT_SECRET: z.string().min(1),

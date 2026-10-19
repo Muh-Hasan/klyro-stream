@@ -5,6 +5,9 @@ const transport = nodemailer.createTransport({
   host: env.SMTP_HOST,
   port: env.SMTP_PORT,
   secure: false,
+  connectionTimeout: 10_000,
+  greetingTimeout: 10_000,
+  socketTimeout: 30_000,
 });
 
 type Mail = { to: string; subject: string; text: string; html?: string };

@@ -1,6 +1,6 @@
 import { env } from '../config/env.js';
 import type { ClubRole } from '../lib/db/schema.js';
-import { sendMail } from '../lib/mail/mailer.js';
+import { enqueueEmail } from '../lib/queue/queues.js';
 import * as clubRepo from '../repositories/club.repository.js';
 import * as invitationRepo from '../repositories/invitation.repository.js';
 import * as userRepo from '../repositories/user.repository.js';
@@ -73,12 +73,15 @@ export const inviteMember = async (
   }
 
   const link = `${env.INVITE_URL}?token=${token}`;
-  void sendMail({
-    to: email,
-    subject: `You're invited to join ${club.name} on KlyroStream`,
-    text: `${inviter.email} invited you to join ${club.name} as ${roleLabel[role]}.\n\nAccept or decline here (valid for 7 days):\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`,
-  }).catch((err: unknown) =>
-    logger.error({ err, invitationId: invitation.id }, 'invitation email failed'),
+  void enqueueEmail(
+    {
+      to: email,
+      subject: `You're invited to join ${club.name} on KlyroStream`,
+      text: `${inviter.email} invited you to join ${club.name} as ${roleLabel[role]}.\n\nAccept or decline here (valid for 7 days):\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`,
+    },
+    `email-invitation-${invitation.id}`,
+  ).catch((err: unknown) =>
+    logger.error({ err, invitationId: invitation.id }, 'could not queue the invitation email'),
   );
 
   return {

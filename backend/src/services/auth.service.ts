@@ -1,5 +1,5 @@
 import { env } from '../config/env.js';
-import { sendMail } from '../lib/mail/mailer.js';
+import { enqueueEmail } from '../lib/queue/queues.js';
 import * as passwordReset from '../repositories/password-reset.repository.js';
 import * as tokenBlacklist from '../repositories/token-blacklist.repository.js';
 import * as userRepo from '../repositories/user.repository.js';
@@ -116,11 +116,13 @@ export const forgotPassword = async ({ email }: ForgotPasswordInput) => {
   await passwordReset.save(hashToken(token), user.id);
 
   const link = `${env.PASSWORD_RESET_URL}?token=${token}`;
-  void sendMail({
+  void enqueueEmail({
     to: user.email,
     subject: 'Reset your KlyroStream password',
     text: `Reset your password using this link (valid for 30 minutes):\n\n${link}\n\nIf you didn't ask for this, ignore this email.`,
-  }).catch((err: unknown) => logger.error({ err, userId: user.id }, 'reset email failed'));
+  }).catch((err: unknown) =>
+    logger.error({ err, userId: user.id }, 'could not queue the reset email'),
+  );
 };
 
 export const resetPassword = async ({ token, password }: ResetPasswordInput) => {

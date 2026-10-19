@@ -10,7 +10,6 @@ import type { Server } from 'node:http';
 import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { closeDb } from './lib/db/client.js';
-import { closeMailer } from './lib/mail/mailer.js';
 import { closeQueueConnections } from './lib/queue/connection.js';
 import { closeQueues } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
@@ -44,7 +43,6 @@ const shutdown = async (reason: string, exitCode = 0) => {
   server.closeIdleConnections(); // drop idle keep-alive sockets now; busy ones finish first
   await closing;
 
-  closeMailer();
   const results = await Promise.allSettled([
     Promise.allSettled([closeQueues(), videoEvents.close()]).finally(closeQueueConnections),
     closeDb(),
