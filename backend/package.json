@@ -25,7 +25,8 @@
     "upload": "tsx src/scripts/upload.ts",
     "videos:requeue-stuck": "tsx src/scripts/requeue-stuck.ts",
     "videos:expire-uploads": "tsx src/scripts/expire-uploads.ts",
-    "videos:play": "tsx src/scripts/hls-player.ts"
+    "videos:play": "tsx src/scripts/hls-player.ts",
+    "socket:listen": "tsx src/scripts/socket-listen.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1146.0",
