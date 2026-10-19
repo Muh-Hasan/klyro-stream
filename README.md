@@ -34,6 +34,9 @@ flowchart LR
     W -- "6 · READY + paths + duration" --> PG
     P["Player<br/>hls.js"] -- "7 · playlists via the API (Bearer)" --> API
     HLS -- "8 · segments on 5-minute signed URLs" --> P
+    Q -- "progress · completed · failed" --> API
+    API -- "Socket.io: video:progress / ready / failed" --> C
+    W -- "send-email job" --> Q
 ```
 
 Measured on a laptop: a 4K, 32 s clip (239 MB) transcodes in ~42 s; a 1080p, 2-minute clip (298 MB) in ~133 s. Details in [transcoding](docs/learning/transcoding.md).
@@ -45,7 +48,9 @@ Measured on a laptop: a 4K, 32 s clip (239 MB) transcodes in ~42 s; a 1080p, 2-m
 | Repair stuck videos | `npm run videos:requeue-stuck -- --dry-run` |
 | Expire abandoned uploads | `npm run videos:expire-uploads -- --dry-run` |
 | Watch READY videos (dev player, with a network throttle) | `npm run videos:play`, then http://localhost:4100; **play through the API** uses signed playlists and asks for an access token |
+| Watch a club's live events (progress, ready, failed) | `npm run socket:listen -- --club <clubId>` with `KLYRO_EMAIL` / `KLYRO_PASSWORD` set |
+| Emails (invitations, resets, video ready/failed) | sent by the worker from the `notifications` queue; read them in Mailpit at http://localhost:8025 |
 | Raise a club's download quota | `PATCH /admin/clubs/:clubId/quota` with the Bull Board credentials (Bruno: admin → Set club quota) |
 | API requests | the Bruno collection in `bruno/` ([guide](docs/bruno.md)) |
 
-How it works: [uploads](docs/learning/uploads.md) · [job queues and workers](docs/learning/queues.md) · [transcoding and HLS](docs/learning/transcoding.md) · [library, playback and downloads](docs/learning/playback.md) · [transactions](docs/learning/transactions.md) · [locking](docs/learning/locking.md) · [indexes](docs/learning/indexes.md)
+How it works: [uploads](docs/learning/uploads.md) · [job queues and workers](docs/learning/queues.md) · [transcoding and HLS](docs/learning/transcoding.md) · [library, playback and downloads](docs/learning/playback.md) · [real-time events and email](docs/learning/realtime.md) · [transactions](docs/learning/transactions.md) · [locking](docs/learning/locking.md) · [indexes](docs/learning/indexes.md)

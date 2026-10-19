@@ -191,7 +191,7 @@ One sprint at a time, no calendar. A sprint is done when its checklist is ticked
 | S5 Job queue | Jobs flow and retry in Bull Board | Done (GIF pending) |
 | S6 Transcoding | Raw video in, playable HLS out | Done (GIF pending) |
 | S7 Library and playback | Search, stream and download through the API | Done (GIF pending) |
-| S8 Real-time and email | Upload in one client, live "ready" event in another | Not started |
+| S8 Real-time and email | Upload in one client, live "ready" event in another | Done (GIF pending) |
 | S9 Observability | Live Grafana dashboard and log search | Not started |
 | S10 Frontend demo | Recorded upload-to-playback demo | Not started |
 | S11 Proof and polish | Reviewer runs it in one command; README has numbers | Not started |
@@ -1072,10 +1072,10 @@ export const initRealtime = (server: http.Server) => {
 };
 ```
 
-- [ ] Sockets require a valid access token
-- [ ] Clients only receive events for clubs they belong to
-- [ ] Progress, ready and failed events all reach the client
-- [ ] Emails are sent from a queue with retries
+- [x] Sockets require a valid access token
+- [x] Clients only receive events for clubs they belong to
+- [x] Progress, ready and failed events all reach the client
+- [x] Emails are sent from a queue with retries
 - [ ] GIF: upload in one window, live update in another
 
 ## Sprint 9 — Observability
