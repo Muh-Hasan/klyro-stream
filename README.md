@@ -32,7 +32,8 @@ flowchart LR
     RAW -- "download" --> W
     W -- "one FFmpeg run: 1080/720/480 HLS + thumbnail" --> HLS[("RustFS<br/>hls-output · thumbnails")]
     W -- "6 · READY + paths + duration" --> PG
-    HLS -- "7 · master.m3u8 → segments" --> P["Player<br/>hls.js"]
+    P["Player<br/>hls.js"] -- "7 · playlists via the API (Bearer)" --> API
+    HLS -- "8 · segments on 5-minute signed URLs" --> P
 ```
 
 Measured on a laptop: a 4K, 32 s clip (239 MB) transcodes in ~42 s; a 1080p, 2-minute clip (298 MB) in ~133 s. Details in [NOTES.md](docs/NOTES.md).
@@ -43,7 +44,8 @@ Measured on a laptop: a 4K, 32 s clip (239 MB) transcodes in ~42 s; a 1080p, 2-m
 | Job dashboard (Bull Board) | http://localhost:4000/admin/queues, with `BULL_BOARD_USER` / `BULL_BOARD_PASSWORD` set in `.env` |
 | Repair stuck videos | `npm run videos:requeue-stuck -- --dry-run` |
 | Expire abandoned uploads | `npm run videos:expire-uploads -- --dry-run` |
-| Watch READY videos (dev player, with a network throttle) | `npm run videos:play`, then http://localhost:4100 |
+| Watch READY videos (dev player, with a network throttle) | `npm run videos:play`, then http://localhost:4100; **play through the API** uses signed playlists and asks for an access token |
+| Raise a club's download quota | `PATCH /admin/clubs/:clubId/quota` with the Bull Board credentials (Bruno: admin → Set club quota) |
 | API requests | the Bruno collection in `bruno/` ([guide](docs/bruno.md)) |
 
-How it works: [uploads](docs/learning/uploads.md) · [job queues and workers](docs/learning/queues.md) · [transcoding and HLS](docs/learning/transcoding.md) · [locking](docs/learning/locking.md) · [indexes](docs/learning/indexes.md)
+How it works: [uploads](docs/learning/uploads.md) · [job queues and workers](docs/learning/queues.md) · [transcoding and HLS](docs/learning/transcoding.md) · [library, playback and downloads](docs/learning/playback.md) · [transactions](docs/learning/transactions.md) · [locking](docs/learning/locking.md) · [indexes](docs/learning/indexes.md)

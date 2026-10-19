@@ -190,7 +190,7 @@ One sprint at a time, no calendar. A sprint is done when its checklist is ticked
 | S4 Uploads | Upload a 1 GB file, kill it mid-way, resume it | Not started |
 | S5 Job queue | Jobs flow and retry in Bull Board | Done (GIF pending) |
 | S6 Transcoding | Raw video in, playable HLS out | Done (GIF pending) |
-| S7 Library and playback | Search, stream and download through the API | Not started |
+| S7 Library and playback | Search, stream and download through the API | Done (GIF pending) |
 | S8 Real-time and email | Upload in one client, live "ready" event in another | Not started |
 | S9 Observability | Live Grafana dashboard and log search | Not started |
 | S10 Frontend demo | Recorded upload-to-playback demo | Not started |
@@ -1015,12 +1015,12 @@ export const variantPlaylist = async (videoId: string, variant: string) => {
 // frontend: hls.js adds the Bearer token to playlist requests via its xhrSetup option
 ```
 
-- [ ] Listing is paginated, filterable and searchable; search input is escaped
-- [ ] Streams play only through signed, expiring URLs
-- [ ] Quota is enforced atomically; every download is logged
-- [ ] Delete leaves no orphaned objects
-- [ ] ADR written: how playlists are signed, and what changes with CloudFront in Phase 2
-- [ ] Bruno collection complete
+- [x] Listing is paginated, filterable and searchable; search input is escaped
+- [x] Streams play only through signed, expiring URLs
+- [x] Quota is enforced atomically; every download is logged
+- [x] Delete leaves no orphaned objects
+- [x] ~~ADR written~~ (dropped by decision; signing and the CloudFront signed-cookie plan are explained in `docs/learning/playback.md` §9)
+- [x] Bruno collection complete (in `bruno/`, not `docs/api/`)
 
 ## Sprint 8 — Real-time events and email notifications
 

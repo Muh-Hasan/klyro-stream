@@ -81,7 +81,7 @@ For parallel parts and resume after a kill, use the CLI: `npm run upload -- <fil
 
 ## Job dashboard (admin)
 
-`admin/Queue counts` calls the JSON API behind Bull Board (`/admin/queues/api/queues`) with HTTP basic auth and asserts the `video-processing` queue is there. It reads two **secret** environment variables, `bullBoardUser` and `bullBoardPassword`. Set them in **Environments → local** to the `BULL_BOARD_USER` / `BULL_BOARD_PASSWORD` values from `backend/.env`; Bruno keeps secret values out of the `.bru` file.
+`admin/Set club quota` changes a club's download limit (operator only; see below). `admin/Queue counts` calls the JSON API behind Bull Board (`/admin/queues/api/queues`) with HTTP basic auth and asserts the `video-processing` queue is there. It reads two **secret** environment variables, `bullBoardUser` and `bullBoardPassword`. Set them in **Environments → local** to the `BULL_BOARD_USER` / `BULL_BOARD_PASSWORD` values from `backend/.env`; Bruno keeps secret values out of the `.bru` file.
 
 ```bash
 cd bruno
@@ -89,3 +89,28 @@ npx @usebruno/cli run admin --env local --env-var bullBoardUser=admin --env-var 
 ```
 
 The dashboard itself is at http://localhost:4000/admin/queues in a browser. See [learning/queues.md](learning/queues.md).
+
+## Library, playback and downloads (Sprint 7)
+
+These requests use a `videoId` that is already **READY**. Set it in the environment, or run them after an upload has finished transcoding. Set `clubId` and `accessToken` as above.
+
+| # | Request | Method and path | Expect |
+|---|---|---|---|
+| 7 | List club videos | `GET /clubs/{{clubId}}/videos?page&limit&status&q` | 200 `{ items, page, limit, total }` |
+| 8 | Get video | `GET /videos/{{videoId}}` | 200, with `resolution` and a 10-minute `thumbnailUrl` |
+| 9 | Update video | `PATCH /videos/{{videoId}}` | 200; viewers get 403 |
+| 11 | Stream master playlist | `GET /videos/{{videoId}}/stream/master.m3u8` | 200, variant lines like `720p.m3u8` |
+| 12 | Stream variant playlist | `GET /videos/{{videoId}}/stream/{{rendition}}.m3u8` | 200, every segment a 5-minute presigned URL |
+| 13 | Download video | `POST /videos/{{videoId}}/download` | 200 with a presigned `attachment` URL; uses one unit of quota |
+| 14 | Delete video | `DELETE /videos/{{videoId}}` | 204; **deletes for real**, which is why it runs last |
+| | clubs → Get club quota | `GET /clubs/{{clubId}}/quota` | 200 `{ quota: { limit, used, remaining } }` |
+| | admin → Set club quota | `PATCH /admin/clubs/{{clubId}}/quota` (Basic auth) | 200; asserts the new limit |
+
+To watch a stream rather than read it, use the dev player: `npm run videos:play`, open http://localhost:4100, pick **play through the API** under a video and paste an access token. See [learning/playback.md](learning/playback.md).
+
+```bash
+cd bruno
+npx @usebruno/cli run "videos/Get video.bru" --env local --env-var accessToken=<token> --env-var videoId=<readyVideoId>
+```
+
+Checked from the CLI: all 9 requests above returned their expected status. **Set club quota** and **Queue counts** passed 2/2 assertions each, and **Delete video** was pointed at a throwaway row.

@@ -43,3 +43,34 @@ Output: 32 s of 4K (239 MB) → 36 MB of HLS across three renditions (15% of the
 - Throttle removed: within ~0.5 s it fetched 720p from segment 12 and 1080p from segment 14, re-fetching segment 14 at the higher quality.
 - At 1.5 Mbps even 480p (peak 1.65 Mbps) briefly stalled. A 360p rung (~800 kbps) would cover slow mobile connections; worth adding.
 - hls.js buffers up to 60 MB ahead (~90 s of 1080p), so a throttle applied mid-playback only shows after that buffer drains.
+
+## Sprint 7: library, playback and downloads
+
+**Surprise:** in my measurement, the "obvious" quota code granted **20 downloads against a limit of 5**, and its counter read 2. Read-check-write lost every concurrent update. Writing `used = used + 1` fixed the counter but still granted 13–14, because the decision was made from a stale read. Only a single `UPDATE … WHERE used < limit RETURNING` (or `FOR UPDATE`) gave exactly 5. Through the real endpoint: 20 parallel requests with 5 left gave 5 × 200 and 15 × 403.
+
+**Decisions:**
+
+- **Playlists through the API, segments straight from storage.** Signing only `master.m3u8` can't work: a presigned URL covers one key, and the player then asks for unsigned children. The API rewrites variant lines to relative API routes and segment lines to 5-minute presigned URLs.
+- **5-minute segment URLs plus a player refresh, not long-lived URLs.** VOD playlists are read once, so URLs expire mid-playback. The dev player retries a 403 after swapping fresh URLs into hls.js's fragments. Playback continues with no rewind. Signing for the whole video length would make leaked links last hours.
+- **Delete order:** abort the upload, remove the job (atomic in Redis; 409 if a worker holds it), delete objects 1,000 at a time, then the row last, so a failure can be retried and nothing is orphaned.
+- **Quota raised only by the operator** (Basic auth under `/admin`), never by a club admin. Download history keeps its rows when a video is deleted (`video_id` → NULL, `club_id` kept).
+
+**Hardest bugs:**
+
+- The validation middleware dropped Zod's `formErrors`, so whole-body errors (a `refine` on `{}`, a body of `[]`) came back as `"body": {}` on every route.
+- Adding the quota endpoint under `/admin` made the admin rate limiter count 400s and 404s. An operator's typos would have locked them out of Bull Board too. Now only 401s count.
+- `DeleteObjects` returns 200 even when keys fail, listing them in `Errors`, which the old cleanup ignored.
+- Drizzle generated `ADD COLUMN club_id uuid NOT NULL`, which fails on any non-empty table. It was rewritten as add, backfill, set NOT NULL, and proven in a rolled-back transaction first.
+
+### Numbers
+
+| What | Measured |
+|---|---|
+| List page 1 of 50k rows | Index Scan Backward on `videos_club_created_idx`, 21 rows read |
+| List page 40 (`OFFSET 780`) | bitmap scan + sort of 800 rows, 1.94 ms |
+| Variant playlist, 20 segments | 39 ms for the whole request |
+| Signing 1,200 segment URLs (a 2-hour rendition) | 525–916 ms, ~0.45 ms each |
+| Delete a video with 2,500 HLS objects | 8.2 s (3 list + 3 `DeleteObjects` calls, in sequence) |
+| 20 parallel downloads, 5 left | 5 × 200, 15 × 403, 285 ms |
+
+**Local vs real S3:** RustFS accepts a presigned URL that also carries `Authorization: Bearer`; AWS S3 rejects it (two auth mechanisms). The player sends the token only to API URLs.
