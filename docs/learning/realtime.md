@@ -12,8 +12,10 @@ Related: [queues.md](queues.md) (BullMQ, workers, retries) · [transcoding.md](t
 4. [CORS doesn't protect WebSockets](#4-cors-doesnt-protect-websockets)
 5. [Shutting down with connections open](#5-shutting-down-with-connections-open)
 6. [Stages 1–2 code: the socket server](#6-stages-12-code-the-socket-server)
+7. [Stage 3: rooms, and who hears what](#7-stage-3-rooms-and-who-hears-what)
+8. [Stage 4: relaying worker events](#8-stage-4-relaying-worker-events)
 
-Coming in later stages: rooms and membership, relaying worker events, email through a queue, several API processes.
+Coming in later stages: email through a queue, several API processes.
 
 ---
 
@@ -203,7 +205,7 @@ The client saw `disconnect: transport close`. That's a **network-level** reason,
 
 | File | What |
 |---|---|
-| `src/lib/realtime/socket.ts` | `createRealtime(httpServer)`: CORS, message size limit, auth middleware, per-user room, expiry timer |
+| `src/realtime/server.ts` (started as `src/lib/realtime/socket.ts`; moved in stage 3, see section 7) | `createRealtime(httpServer)`: CORS, message size limit, auth middleware, per-user room, expiry timer |
 | `src/utils/tokens.ts` | `readAccessToken(token)` returns `{ userId, expiresAt }`; `verifyAccessToken` is unchanged for HTTP |
 | `src/server.ts` | `createRealtime(server)` after `listen`; shutdown uses `realtime.close()` |
 
@@ -247,3 +249,210 @@ Every connection joins `user:<id>` straight away. One user can have several conn
 | polling handshake from `localhost:5173` / `evil.example` | `Access-Control-Allow-Origin` set / absent |
 | default client (`polling` then `websocket`) | on `websocket` after 0.5 s |
 | `docker stop` with a socket open: old / new shutdown | 10.9 s, forced / 0.7 s, clean |
+
+
+---
+
+## 7. Stage 3: rooms, and who hears what
+
+A **room** is a named group of connections on the server. `socket.join('club:42')` adds a connection, and `io.to('club:42').emit(...)` reaches everyone in it. Rooms live **only on the server**: a client can't see which rooms it's in, and can't join one by itself. It has to ask, and the server decides.
+
+### The rooms
+
+| Room | Who's in it | Gets |
+|---|---|---|
+| `user:<userId>` | every connection of that user, joined automatically | membership changes (`club:membership`) |
+| `club:<clubId>` | members who sent `club:join` | `video:ready` |
+| `club:<clubId>:managers` | club owners and admins who sent `club:join` | `video:progress`, `video:failed` |
+
+The split follows the visibility rule from Sprint 7 ([playback.md §6](playback.md#6-stage-1-code-the-list-endpoint)): a viewer can't see a video until it's READY, so a viewer mustn't get progress for it, or learn from a failure event that it ever existed.
+
+```mermaid
+flowchart LR
+    subgraph Club42["club 42"]
+        M["club:42<br/>viewer, owner, admin"]
+        G["club:42:managers<br/>owner, admin"]
+    end
+    W["worker events"] -- "video:ready" --> M
+    W -- "video:progress, video:failed" --> G
+    U["user:7 (all tabs of user 7)"] -. "club:membership" .-> U
+```
+
+### Joining: a request with a reply
+
+```ts
+socket.emit('club:join', clubId, (result) => { ... });   // client
+
+// server reply:
+{ ok: true, clubId, role: 'viewer', rooms: ['club:42'] }
+{ ok: false, error: { code: 'CLUB_NOT_FOUND', message: 'Club not found' } }
+```
+
+The function passed as the last argument is an **acknowledgement**: Socket.io sends the server's reply back to exactly that call, like the response to an HTTP request. Without it the client couldn't tell "joined" from "refused".
+
+The handler follows the same rules as the HTTP API:
+
+- **Validate input, never trust it.** `clubId` is typed `unknown` and checked with `z.uuid()`. **Measured:** `'not-a-uuid'` and `{ $ne: null }` (a NoSQL-injection-style object) both got `VALIDATION_ERROR`.
+- **404, not 403, for clubs you're not in,** so a socket can't be used to discover which club ids exist.
+- **The role comes from the database, not the client.** `roomsFor(clubId, role)` decides the rooms.
+- **No ack, no crash.** A client may leave out the callback, and the handler then replies into a no-op function. **Measured:** `emit('club:join', id)` without an ack → the server stayed healthy and the socket joined.
+
+### Async errors in socket handlers
+
+Express 5 catches a rejected promise from a route and turns it into a 500. **Socket.io doesn't**: an `async` listener that throws becomes an *unhandled rejection*, and our `server.ts` treats that as a bug and **shuts the process down** (Sprint 0). One failed database query in `club:join` would take the whole API with it. So every handler goes through a wrapper:
+
+```ts
+const handle =
+  (socket: RealtimeSocket, event: string, work: (clubId: string) => Promise<RoomResult>) =>
+  (input: unknown, ack?: Ack) => {
+    const reply: Ack = typeof ack === 'function' ? ack : () => undefined;
+    const parsed = clubId.safeParse(input);
+    if (!parsed.success) {
+      reply(invalidClubId);
+      return;
+    }
+    work(parsed.data)
+      .then(reply)
+      .catch((err: unknown) => {
+        logger.error({ err, event, socketId: socket.id, userId: socket.data.userId }, 'socket handler failed');
+        reply(fail('INTERNAL_ERROR', 'Something went wrong'));
+      });
+  };
+```
+
+It's the socket version of the error middleware: validate, run, and turn any failure into a logged error plus a polite reply.
+
+### When membership changes while connected
+
+Rooms are checked at **join** time. If an admin then removes a member, or demotes an owner to viewer, the connection would stay in the rooms it joined and keep hearing events it's no longer allowed to.
+
+So `member.service.ts` calls `syncMembership` right after the database change commits:
+
+```ts
+const member = await memberRepo.changeRole(clubId, userId, role);
+syncMembership(userId, clubId, role);
+```
+
+```ts
+const sockets = await io.in(userRoom(userId)).fetchSockets();
+for (const socket of sockets) {
+  if (!socket.rooms.has(clubRoom(clubId))) continue;
+  if (role === null) socket.leave(clubRoom(clubId));
+  if (role === null || !isManager(role)) socket.leave(managersRoom(clubId));
+  else socket.join(managersRoom(clubId));
+  socket.emit('club:membership', { clubId, role });
+}
+```
+
+- **`user:<id>` finds every connection of that user,** across all their tabs and devices. Only those that actually joined the club are changed and told.
+- **`fetchSockets()` returns a list we can filter,** because Socket.io has no "in room A **and** room B" query. `io.in(a).in(b)` means "in A **or** B".
+- **It runs after the commit and doesn't block the HTTP response.** A failure is logged, not thrown, so a hiccup in the realtime layer never fails a membership change that already happened in the database. The worst case is that the user keeps hearing events until their token expires (at most 15 minutes, section 3).
+- **Promotion works the same way:** a viewer promoted to club owner joins the managers room without reconnecting.
+
+### Where this code lives
+
+Socket code does two jobs: it's an **entry point** (it handles `club:join` from clients, like a controller) and an **output** (services push room changes through it, like the queue). So it has its own top-level folder, next to `routes/` and `worker/`:
+
+| File | Role |
+|---|---|
+| `realtime/events.ts` | The typed protocol: what the client may send, what the server may emit |
+| `realtime/server.ts` | `createRealtime`: CORS, auth, expiry, wiring the handlers |
+| `realtime/club-handlers.ts` | `club:join` / `club:leave` |
+| `realtime/rooms.ts` | Room names, `roomsFor`, `syncMembership`, and the one reference to the server |
+| `realtime/video-events.ts` | The worker → client relay (section 8) |
+| `utils/roles.ts` | `hasRole`, `isManager`: one role ranking, shared with `requireClubRole` and the video rules |
+
+`rooms.ts` holds the server instance in a module variable (`setRealtime`). The worker process never creates one, so `syncMembership` is a safe no-op there.
+
+### What was tested
+
+| Case | Result |
+|---|---|
+| join with `'not-a-uuid'` / `{ $ne: null }` | `VALIDATION_ERROR` |
+| join a club you're not in / leave before joining | `CLUB_NOT_FOUND` |
+| join without an acknowledgement | no crash; `/health` still 200 |
+| viewer joins / admin joins | rooms `[club]` / `[club, managers]` |
+| promote the viewer to club owner (two tabs joined) | both tabs get `club:membership { role: 'club_owner' }` |
+| demote back to viewer | `club:membership { role: 'viewer' }` |
+| tab 2 leaves, then the member is removed | tab 1 gets `role: null`; tab 2 (not in the club rooms) gets nothing |
+| the removed member tries to join again | `CLUB_NOT_FOUND` |
+
+---
+
+## 8. Stage 4: relaying worker events
+
+### The problem: the worker can't reach browsers
+
+The worker runs in its own process (in Docker, even). Browsers are connected to the **API**. The worker doesn't know which connections exist, and shouldn't: it would then need the socket server, the rooms and the auth.
+
+They already share one thing: **Redis**. BullMQ writes every job event to a **Redis stream** (`bull:video-processing:events`): `progress`, `completed`, `failed`. `QueueEvents` in the API reads that stream and turns each entry into a Node event.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant R as Redis stream
+    participant A as API (QueueEvents)
+    participant P as Postgres
+    participant M as club:42:managers
+    participant C as club:42
+    W->>R: progress 10, 11, 12 … (≈ every 0.5 s)
+    R-->>A: progress {jobId: video-<id>, data: 12}
+    A->>A: throttle: same %, or < 1 s since the last one? drop
+    A->>P: clubId of <id> (once, then cached)
+    A-)M: video:progress {videoId, clubId, percent}
+    W->>P: UPDATE … READY
+    W->>R: completed
+    R-->>A: completed {jobId}
+    A->>P: SELECT the video (status, title, size)
+    A-)C: video:ready {videoId, clubId, title, durationSeconds, resolution}
+```
+
+`QueueEvents` blocks on Redis (`XREAD BLOCK`), waiting for new entries, so it gets its own connection. `queueConnection('events')` is a third role next to `producer` and `worker`. A blocking command on the shared producer connection would stall every `queue.add` behind it.
+
+### Turning job events into video events
+
+```ts
+export const videoIdFromJobId = (jobId: string) =>
+  jobId.startsWith('video-') ? jobId.slice('video-'.length) : undefined;
+```
+
+Jobs are named `video-<videoId>` (Sprint 5), so the relay knows which video an event is about with no lookup table. Anything else on the queue is ignored.
+
+- **`completed` → `video:ready`, after re-reading the row.** The relay checks `status === 'READY'` in the database rather than trusting the event: the database is the truth, the event is a hint. The title and resolution come from the same read.
+- **`failed` only fires for the final failure.** A failed attempt that will be retried goes to `delayed`, not `failed`. BullMQ's `moveToFinished` script writes the `failed` entry only when the job lands in the failed set. So `video:failed` means "this video is ERROR", never "attempt 1 of 3 failed".
+- **Each instance sends to its own sockets** (`io.local.to(...)`). That matters once there are several API processes (section 11). With one process, it's the same as `io.to(...)`.
+
+### Throttling progress
+
+The worker reports progress on every FFmpeg progress line, about twice a second. Every report travels Redis → API → every manager's browser, and re-renders a progress bar. Nobody needs 10.4% then 10.9%.
+
+```ts
+const shouldSend = (videoId: string, percent: number) => {
+  const now = Date.now();
+  const last = lastSent.get(videoId);
+  if (last && (percent === last.percent || now - last.at < PROGRESS_INTERVAL_MS)) return false;
+  lastSent.set(videoId, { percent, at: now });
+  return true;
+};
+```
+
+**Measured** on a 90 s 1080p upload: the worker published **104** progress updates; managers received **56**, never closer together than **996 ms**, each a whole-number percent different from the one before. The video was READY and `video:ready` arrived **71 s** after the upload finished.
+
+The state (`lastSent`, plus a cached promise of each video's club id) is per video and is dropped on `completed` or `failed`. The cache holds a **promise**, so ten progress events arriving at once for a new video share one database query instead of making ten.
+
+### What a client should do with these
+
+They're hints. At most once, no replay (section 1):
+
+- **`video:progress`:** update a progress bar. Missing one doesn't matter.
+- **`video:ready`:** refresh the list or that video with HTTP. If the socket was down at that moment, the next `GET /clubs/:id/videos` shows it anyway.
+- **`video:failed`:** show the reason to the managers. The video is also in the list as `ERROR` with its `errorMessage`.
+
+### What was tested
+
+| Case | Result |
+|---|---|
+| 90 s 1080p upload, admin joined | 56 `video:progress` (10 → 100, min gap 996 ms) out of 104 raw updates; `video:ready` with title, `durationSeconds: 90`, `resolution: 1920×1080` |
+| same upload, viewer joined | only `video:ready`, no progress |
+| a 6 MB file of random bytes | admin: `video:failed` with `ffprobe could not read the file: … Invalid data found when processing input`; viewer: nothing |
+| `video:ready` timing | the row was already `READY` when the event arrived |
