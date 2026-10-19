@@ -1,5 +1,6 @@
 import type { RequestHandler } from 'express';
 import { getInput } from '../middleware/validate.middleware.js';
+import * as downloadService from '../services/download.service.js';
 import * as streamService from '../services/stream.service.js';
 import * as videoService from '../services/video.service.js';
 import { currentMembership } from '../utils/current-membership.js';
@@ -8,6 +9,7 @@ import type {
   abortUploadSchemas,
   completeUploadSchemas,
   deleteVideoSchemas,
+  downloadVideoSchemas,
   getVideoSchemas,
   initiateUploadSchemas,
   listVideosSchemas,
@@ -49,6 +51,12 @@ export const stream: RequestHandler = async (req, res) => {
       ? await streamService.masterPlaylist(params.videoId, userId)
       : await streamService.variantPlaylist(params.videoId, params.rendition, userId);
   res.set('Cache-Control', 'no-store').type('application/vnd.apple.mpegurl').send(playlist);
+};
+
+export const download: RequestHandler = async (req, res) => {
+  const { params } = getInput<typeof downloadVideoSchemas>(res);
+  const result = await downloadService.createDownload(params.videoId, currentUser(req).id);
+  res.json(result);
 };
 
 export const initiateUpload: RequestHandler = async (req, res) => {

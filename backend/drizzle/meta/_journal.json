@@ -29,6 +29,13 @@
       "when": 1792404051851,
       "tag": "0003_video_resolution",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1792406667298,
+      "tag": "0004_download_logs_keep_history",
+      "breakpoints": true
     }
   ]
 }

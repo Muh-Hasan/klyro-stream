@@ -136,6 +136,10 @@ export const streamSchemas = {
   }),
 };
 
+export const downloadVideoSchemas = {
+  params: videoParams,
+};
+
 export const updateVideoSchemas = {
   params: videoParams,
   body: z

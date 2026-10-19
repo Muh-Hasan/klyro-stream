@@ -1,0 +1,43 @@
+meta {
+  name: Download video
+  type: http
+  seq: 13
+}
+
+post {
+  url: {{baseUrl}}/videos/{{videoId}}/download
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+docs {
+  Any member who can see the video, READY only. Each call uses **one unit of the club's download quota** and writes a `download_logs` row, both in one transaction. The response is a 5-minute presigned URL for the **original upload**. Storage sends it with `Content-Disposition: attachment`, so a browser saves the file instead of playing it. The disposition is part of the signature: change it and storage returns 403.
+
+  | Status | Code | When |
+  |---|---|---|
+  | 200 | | download created and logged |
+  | 403 | `QUOTA_EXCEEDED` | the club has no downloads left (see Get club quota) |
+  | 404 | `VIDEO_NOT_FOUND` | you can't see this video |
+  | 404 | `VIDEO_FILE_MISSING` | the original file is gone from storage; no quota is used |
+  | 409 | `VIDEO_NOT_READY` | the video isn't READY |
+
+  Example response:
+
+  ```json
+  {
+    "download": {
+      "url": "http://localhost:9000/raw-uploads/clubs/42c0a5d2-.../videos/4dce8038-.../original.mp4?X-Amz-...&X-Amz-Expires=300&response-content-disposition=attachment%3B%20filename%3D%22Two-minute%20demo%20%281080p%29.mp4%22%3B%20filename%2A%3DUTF-8%27%27...&X-Amz-Signature=...",
+      "filename": "Two-minute demo (1080p).mp4",
+      "sizeBytes": 297873717,
+      "expiresAt": "2026-10-19T11:05:00.000Z"
+    },
+    "quota": { "limit": 100, "used": 1, "remaining": 99 }
+  }
+  ```
+
+  Quota is used when the link is created, not when the file finishes downloading. Storage can't tell the API that a download completed, so this is the only point where it can be counted reliably.
+}

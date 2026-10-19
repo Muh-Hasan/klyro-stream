@@ -98,5 +98,18 @@ export const readText = async (bucket: string, key: string): Promise<string> => 
   return Body.transformToString();
 };
 
-export const presignGet = (bucket: string, key: string, expiresIn: number): Promise<string> =>
-  getSignedUrl(s3Public, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn });
+export const presignGet = (
+  bucket: string,
+  key: string,
+  expiresIn: number,
+  contentDisposition?: string,
+): Promise<string> =>
+  getSignedUrl(
+    s3Public,
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      ResponseContentDisposition: contentDisposition,
+    }),
+    { expiresIn },
+  );

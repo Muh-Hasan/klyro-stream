@@ -6,6 +6,7 @@ import {
   abortUploadSchemas,
   completeUploadSchemas,
   deleteVideoSchemas,
+  downloadVideoSchemas,
   getVideoSchemas,
   presignPartsSchemas,
   streamSchemas,
@@ -20,6 +21,7 @@ videosRouter.use(requireAuth);
 videosRouter.get('/:videoId', validate(getVideoSchemas), videoController.get);
 videosRouter.patch('/:videoId', validate(updateVideoSchemas), videoController.update);
 videosRouter.delete('/:videoId', validate(deleteVideoSchemas), videoController.remove);
+videosRouter.post('/:videoId/download', validate(downloadVideoSchemas), videoController.download);
 videosRouter.get(
   '/:videoId/stream/:rendition.m3u8',
   validate(streamSchemas),

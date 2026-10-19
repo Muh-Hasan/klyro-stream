@@ -170,15 +170,17 @@ export const downloadLogs = pgTable(
   'download_logs',
   {
     id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
-    videoId: uuid('video_id')
+    clubId: uuid('club_id')
       .notNull()
-      .references(() => videos.id, { onDelete: 'cascade' }),
+      .references(() => clubs.id, { onDelete: 'cascade' }),
+    videoId: uuid('video_id').references(() => videos.id, { onDelete: 'set null' }),
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'restrict' }),
     downloadedAt: timestamp('downloaded_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [
+    index('download_logs_club_downloaded_idx').on(t.clubId, t.downloadedAt),
     index('download_logs_video_idx').on(t.videoId),
     index('download_logs_user_idx').on(t.userId),
   ],
