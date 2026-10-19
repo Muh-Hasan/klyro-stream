@@ -15,6 +15,7 @@ import { closeQueueConnections } from './lib/queue/connection.js';
 import { closeQueues } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
 import { closeRealtime, createRealtime } from './realtime/server.js';
+import { relayVideoEvents } from './realtime/video-events.js';
 import { logger } from './utils/logger.js';
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -24,6 +25,7 @@ const server: Server = createApp().listen(env.PORT, () => {
 });
 
 const realtime = createRealtime(server);
+const videoEvents = relayVideoEvents(realtime);
 
 let shuttingDown = false;
 
@@ -44,7 +46,7 @@ const shutdown = async (reason: string, exitCode = 0) => {
 
   closeMailer();
   const results = await Promise.allSettled([
-    closeQueues().finally(closeQueueConnections),
+    Promise.allSettled([closeQueues(), videoEvents.close()]).finally(closeQueueConnections),
     closeDb(),
     closeRedis(),
   ]);

@@ -2,14 +2,14 @@ import { Redis } from 'ioredis';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 
-type Role = 'producer' | 'worker';
+type Role = 'producer' | 'worker' | 'events';
 
 const connections = new Map<Role, Redis>();
 
 const createConnection = (role: Role) => {
   const connection = new Redis(env.REDIS_URL, {
     maxRetriesPerRequest: null,
-    enableOfflineQueue: role === 'worker',
+    enableOfflineQueue: role !== 'producer',
     connectionName: `klyro:${role}`,
   });
   connection.on('error', (err) => logger.error({ err, role }, 'queue redis error'));

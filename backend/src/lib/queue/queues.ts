@@ -35,6 +35,9 @@ videoQueue.on('error', (err) => logger.error({ err, queue: VIDEO_QUEUE }, 'queue
 
 export const transcodeJobId = (videoId: string) => `video-${videoId}`;
 
+export const videoIdFromJobId = (jobId: string) =>
+  jobId.startsWith('video-') ? jobId.slice('video-'.length) : undefined;
+
 export const removeTranscodeJob = async (videoId: string) =>
   (await videoQueue.remove(transcodeJobId(videoId))) === 1;
 
