@@ -22,6 +22,7 @@ import type { Membership } from '../types/express.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { paginated, toOffset } from '../utils/pagination.js';
+import { isManager } from '../utils/roles.js';
 import {
   type CompleteUploadInput,
   type InitiateUploadInput,
@@ -31,15 +32,13 @@ import {
   VIDEO_TYPES,
 } from '../validators/video.schema.js';
 
-const UPLOADER_ROLES: readonly ClubRole[] = ['club_owner', 'admin'];
-
 export const THUMBNAIL_URL_TTL_SECONDS = 600;
 
 const thumbnailUrl = (key: string | null) =>
   key ? presignGet(BUCKETS.thumbnails, key, THUMBNAIL_URL_TTL_SECONDS) : null;
 
 const visibleStatuses = (role: ClubRole): readonly VideoStatus[] =>
-  UPLOADER_ROLES.includes(role) ? videoStatusEnum.enumValues : ['READY'];
+  isManager(role) ? videoStatusEnum.enumValues : ['READY'];
 
 export const listVideos = async (
   { clubId, role }: Membership,
@@ -76,7 +75,7 @@ export const requireVisible = async <T extends Pick<Video, 'clubId' | 'status'>>
 };
 
 const canManage = (video: Pick<Video, 'uploadedBy'>, role: ClubRole, userId: string) =>
-  role === 'admin' || (video.uploadedBy === userId && UPLOADER_ROLES.includes(role));
+  role === 'admin' || (video.uploadedBy === userId && isManager(role));
 
 type VideoWithUploader = Video & { uploader: { id: string; email: string } };
 
@@ -159,7 +158,7 @@ const loadOwnUpload = async (videoId: string, userId: string) => {
   if (!video || video.uploadedBy !== userId) throw notFound;
 
   const role = await clubRepo.getMemberRole(video.clubId, userId);
-  if (!role || !UPLOADER_ROLES.includes(role)) throw notFound;
+  if (!role || !isManager(role)) throw notFound;
 
   if (video.status !== 'UPLOADING' || !video.uploadId || !video.rawPath || !video.sizeBytes) {
     throw notInProgress();

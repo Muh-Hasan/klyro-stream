@@ -1,5 +1,6 @@
 import * as clubRepo from '../repositories/club.repository.js';
 import * as memberRepo from '../repositories/member.repository.js';
+import { syncMembership } from '../realtime/rooms.js';
 import type { Membership } from '../types/express.js';
 import { ForbiddenError, NotFoundError } from '../utils/errors.js';
 import { paginated, toOffset } from '../utils/pagination.js';
@@ -22,15 +23,19 @@ export const changeMemberRole = async (
   { role }: UpdateMemberInput,
 ) => {
   await assertNotCreator(clubId, userId, "The club creator's role cannot be changed");
-  return { member: await memberRepo.changeRole(clubId, userId, role) };
+  const member = await memberRepo.changeRole(clubId, userId, role);
+  syncMembership(userId, clubId, role);
+  return { member };
 };
 
 export const removeMember = async ({ clubId }: Membership, userId: string) => {
   await assertNotCreator(clubId, userId, 'The club creator cannot be removed');
   await memberRepo.remove(clubId, userId);
+  syncMembership(userId, clubId, null);
 };
 
 export const leaveClub = async ({ clubId }: Membership, userId: string) => {
   await assertNotCreator(clubId, userId, 'The club creator cannot leave the club');
   await memberRepo.remove(clubId, userId);
+  syncMembership(userId, clubId, null);
 };

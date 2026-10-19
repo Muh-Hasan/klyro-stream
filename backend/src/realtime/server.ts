@@ -1,25 +1,16 @@
 import type { Server as HttpServer } from 'node:http';
 import { Server, type Socket } from 'socket.io';
-import { env } from '../../config/env.js';
-import { logger } from '../../utils/logger.js';
-import { readAccessToken } from '../../utils/tokens.js';
-
-export type ServerToClientEvents = {
-  'auth:expired': () => void;
-};
-
-export type ClientToServerEvents = Record<string, never>;
-
-type InterServerEvents = Record<string, never>;
-
-export type SocketData = { userId: string; expiresAt: number };
-
-export type RealtimeServer = Server<
+import { env } from '../config/env.js';
+import { logger } from '../utils/logger.js';
+import { readAccessToken } from '../utils/tokens.js';
+import { registerClubHandlers } from './club-handlers.js';
+import type {
   ClientToServerEvents,
-  ServerToClientEvents,
   InterServerEvents,
-  SocketData
->;
+  ServerToClientEvents,
+  SocketData,
+} from './events.js';
+import { type RealtimeServer, setRealtime, userRoom } from './rooms.js';
 
 type RealtimeSocket = Socket<
   ClientToServerEvents,
@@ -29,8 +20,6 @@ type RealtimeSocket = Socket<
 >;
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
-
-export const userRoom = (userId: string) => `user:${userId}`;
 
 const unauthorized = (message: string) =>
   Object.assign(new Error(message), { data: { code: 'UNAUTHORIZED' } });
@@ -63,6 +52,7 @@ const onConnection = (socket: RealtimeSocket) => {
   const { userId } = socket.data;
   void socket.join(userRoom(userId));
   disconnectAtExpiry(socket);
+  registerClubHandlers(socket);
 
   logger.debug({ socketId: socket.id, userId }, 'socket connected');
   socket.once('disconnect', (reason) =>
@@ -77,5 +67,11 @@ export const createRealtime = (httpServer: HttpServer): RealtimeServer => {
   });
   io.use(authenticate);
   io.on('connection', onConnection);
+  setRealtime(io);
   return io;
+};
+
+export const closeRealtime = async (io: RealtimeServer) => {
+  setRealtime(undefined);
+  await io.close();
 };

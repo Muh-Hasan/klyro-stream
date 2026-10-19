@@ -12,9 +12,9 @@ import { env } from './config/env.js';
 import { closeDb } from './lib/db/client.js';
 import { closeMailer } from './lib/mail/mailer.js';
 import { closeQueueConnections } from './lib/queue/connection.js';
-import { createRealtime } from './lib/realtime/socket.js';
 import { closeQueues } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
+import { closeRealtime, createRealtime } from './realtime/server.js';
 import { logger } from './utils/logger.js';
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -38,7 +38,7 @@ const shutdown = async (reason: string, exitCode = 0) => {
   }, SHUTDOWN_TIMEOUT_MS);
   forceExit.unref();
 
-  const closing = realtime.close();
+  const closing = closeRealtime(realtime);
   server.closeIdleConnections(); // drop idle keep-alive sockets now; busy ones finish first
   await closing;
 
