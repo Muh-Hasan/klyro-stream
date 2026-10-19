@@ -13,6 +13,7 @@ const base: S3ClientConfig = {
   requestChecksumCalculation: 'WHEN_REQUIRED',
   responseChecksumValidation: 'WHEN_REQUIRED',
   credentials: { accessKeyId: env.S3_ACCESS_KEY, secretAccessKey: env.S3_SECRET_KEY },
+  requestHandler: { connectionTimeout: 3_000, requestTimeout: 30_000 },
 };
 
 export const s3 = new S3Client({ ...base, endpoint: env.S3_ENDPOINT });
