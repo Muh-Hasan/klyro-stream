@@ -16,8 +16,7 @@ Related: [indexes.md](indexes.md) (how B-tree indexes work) · [transactions.md]
 8. [Stage 4: deleting a video](#8-stage-4-deleting-a-video)
 9. [Stage 5: signed HLS streaming](#9-stage-5-signed-hls-streaming)
 10. [Stage 6: downloads and an atomic quota](#10-stage-6-downloads-and-an-atomic-quota)
-
-Coming in later stages: reading and raising a club's quota.
+11. [Stage 7: reading and raising the quota](#11-stage-7-reading-and-raising-the-quota)
 
 ---
 
@@ -802,3 +801,86 @@ That was proven before applying it: inside `BEGIN … ROLLBACK`, insert a log ro
 | download, then delete the video | log row kept: `video_id NULL`, `club_id` set |
 
 The test reset the quota to `limit 100, used 0` and removed its log rows afterwards.
+
+
+---
+
+## 11. Stage 7: reading and raising the quota
+
+```text
+GET   /clubs/:clubId/quota          any member      → { quota: { limit, used, remaining, updatedAt } }
+PATCH /admin/clubs/:clubId/quota    operator only   { limit } → the same shape
+```
+
+### Who may raise a limit
+
+If a club admin could raise their own club's limit, the limit would mean nothing: every club would set it to a million. Raising it is a **platform** decision (in a real product it would follow a plan upgrade or a payment). KlyroStream has no platform-admin role in its user model. Roles live on `club_members` and only mean something inside one club. The one identity that stands above all clubs is the **operator** who runs the service, and the API already has a door for them: the Basic-auth-protected `/admin` area that serves Bull Board.
+
+```mermaid
+flowchart LR
+    subgraph Members["Bearer token (a user)"]
+        G["GET /clubs/:id/quota<br/>requireClubRole('viewer')"]
+    end
+    subgraph Operator["Basic auth (BULL_BOARD_USER / PASSWORD)"]
+        Q["/admin/queues/* (Bull Board)"]
+        P["PATCH /admin/clubs/:id/quota"]
+    end
+    CA["club admin's Bearer token"] -. "401" .-> P
+    CA -. "404: no member route changes the limit" .-> X["PATCH /clubs/:id/quota"]
+```
+
+The admin router used to be mounted at `/admin/queues` and contained only Bull Board. It's now mounted at `/admin`, with auth for the whole area, and the dashboard as one sub-route:
+
+```ts
+router.use(adminLimiter, basicAuth(user, password, 'KlyroStream admin'));
+router.use('/queues', serverAdapter.getRouter() as Router);
+router.patch('/clubs/:clubId/quota', validate(setQuotaLimitSchemas), quotaController.setLimit);
+```
+
+Anything added under `/admin` later is protected by default, because it can only be mounted after the auth middleware. The environment variables are still called `BULL_BOARD_*`; renaming them to `ADMIN_*` would be clearer, but it would break every existing `.env`, so it's left as a known wart.
+
+### A bug the new endpoint exposed: what the limiter counts
+
+`adminLimiter` allows 10 **failed** requests per 15 minutes per IP, using express-rate-limit's `skipSuccessfulRequests`. By default "failed" means any status ≥ 400. With only Bull Board behind it, the only failure was a wrong password. With the quota endpoint behind it, a 400 for `"limit": -1` and a 404 for a mistyped club id also counted. The first test run hit 429 after its own validation cases: **an operator making typos would lock themselves out of the whole admin area**, Bull Board included.
+
+The limiter exists to slow down password guessing, so now only 401s count:
+
+```ts
+skipSuccessfulRequests: authFailuresOnly,
+requestWasSuccessful: (_req, res) => res.statusCode !== 401,
+```
+
+`requestWasSuccessful` only takes effect when `skipSuccessfulRequests` (or `skipFailedRequests`) is on, so the login and register limiters, which count every request, are unchanged. **Measured:** two full test runs (12 non-401 failures) never hit 429. Twelve wrong passwords in a row gave 401 × 10, then 429.
+
+### Lowering a limit below what's been used
+
+An operator may set `limit` below `used`, to cut a club off for example. `used` is never touched by this endpoint, so history stays honest. The response clamps `remaining` at 0 rather than showing `-1`. The download `UPDATE … WHERE used_count < quota_limit` matches nothing, so downloads stop. Raising the limit again by one allows exactly one more.
+
+### Validation
+
+```text
+{ "limit": -1 }        → "The limit cannot be negative."
+{ "limit": 1.5 }       → "The limit must be a whole number."
+{ "limit": "5" }       → "The limit must be a number."     (JSON numbers only; no coercion from strings in a body)
+{ }                    → "The limit is required."
+{ "limit": 1000001 }   → "The limit must be at most 1000000."
+```
+
+The upper bound isn't a business rule. It keeps the value well inside Postgres `integer` (max 2,147,483,647), so an absurd input gets a 400 instead of a database error and a 500.
+
+### What was tested
+
+| Case | Result |
+|---|---|
+| viewer `GET` quota / club they're not in / bad id / no token | 200 / 404 `CLUB_NOT_FOUND` / 400 / 401 |
+| club admin `PATCH /clubs/:id/quota` | 404 (no such member route) |
+| club admin's Bearer token on `PATCH /admin/...` | 401 |
+| no credentials / wrong password | 401 with `WWW-Authenticate: Basic realm="KlyroStream admin"` / 401 |
+| negative, fractional, string, missing, too-big limit | 400 with the messages above |
+| unknown club | 404 `CLUB_NOT_FOUND` |
+| operator sets 250 | 200; members then see `limit 250, remaining 250` |
+| 3 downloads, then limit 2 | `used 3, remaining 0`; the next download → 403 `QUOTA_EXCEEDED`; limit 4 → one more download → `remaining 0` |
+| Bull Board JSON at `/admin/queues/api/queues` with / without credentials | 200 / 401 |
+| 12 wrong passwords | 401 × 10, then 429 |
+
+The tests restored the quota to `limit 100, used 0` and removed their log rows.
