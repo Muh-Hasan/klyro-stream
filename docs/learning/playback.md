@@ -14,8 +14,9 @@ Related: [indexes.md](indexes.md) (how B-tree indexes work) · [transactions.md]
 6. [Stage 1 code: the list endpoint](#6-stage-1-code-the-list-endpoint)
 7. [Stages 2–3: one video, viewing and editing](#7-stages-23-one-video-viewing-and-editing)
 8. [Stage 4: deleting a video](#8-stage-4-deleting-a-video)
+9. [Stage 5: signed HLS streaming](#9-stage-5-signed-hls-streaming)
 
-Coming in later stages: signed HLS streaming, atomic download quotas.
+Coming in later stages: atomic download quotas.
 
 ---
 
@@ -548,3 +549,128 @@ The raw delete uses the **prefix**, not `raw_path`, so anything under that video
 | real 720p upload → READY → delete | resolution saved as 1280×720; 1 raw + 7 HLS + 1 thumbnail before, 0 after; completed job removed |
 | 90 s 1080p upload, delete while the job is **active** | 409 `VIDEO_PROCESSING`; row stays `PROCESSING`; transcode finishes normally (49 HLS objects); delete then → 204, 0 left |
 | queue paused, delete while the job is **waiting** | 204; job gone from Redis; 0 objects; queue resumed with nothing stuck |
+
+
+---
+
+## 9. Stage 5: signed HLS streaming
+
+```text
+GET /videos/:videoId/stream/master.m3u8   → the master playlist, variant lines rewritten to API routes
+GET /videos/:videoId/stream/720p.m3u8     → one rendition, every segment line replaced by a presigned URL
+```
+
+### Why you can't just presign `master.m3u8`
+
+An HLS video isn't one file. It's a tree of files, and the player discovers each one by reading the one above it ([transcoding.md](transcoding.md) shows the layout):
+
+```text
+master.m3u8 ──► 1080p/index.m3u8 ──► seg_000.ts, seg_001.ts, … (20 for a 2-minute video)
+            ──► 720p/index.m3u8  ──► …
+            ──► 480p/index.m3u8  ──► …
+```
+
+A presigned URL covers **exactly one key**. Sign `master.m3u8` and the player can read it, but it then requests `1080p/index.m3u8` relative to that URL, without a signature, and gets 403. Signing the master doesn't sign anything it points to.
+
+Two ways out:
+
+1. **Make the bucket public.** No. Anyone with a video id could watch, member or not.
+2. **Rewrite the playlists so that every URI is already authorized.** That's what we do. The playlists are tiny text files, so the API reads them, checks access, rewrites them and returns them. The big files (segments) still go straight from storage to the browser.
+
+```mermaid
+sequenceDiagram
+    participant P as Player (hls.js)
+    participant A as API
+    participant S as RustFS
+    P->>A: GET /videos/:id/stream/master.m3u8 (Bearer)
+    A->>A: requireVisible + READY?
+    A->>S: GetObject :id/master.m3u8
+    A-->>P: master with "720p.m3u8" lines
+    P->>A: GET /videos/:id/stream/720p.m3u8 (Bearer)
+    A->>S: GetObject :id/720p/index.m3u8
+    A->>A: presign every seg_NNN.ts (5 min)
+    A-->>P: playlist of signed segment URLs
+    loop every 6 s of video
+        P->>S: GET seg_NNN.ts?X-Amz-Signature=...
+        S-->>P: video/mp2t
+    end
+```
+
+**Access is checked on every playlist request,** so removing a member stops them within one playlist fetch. The worst case is a stream that keeps going on segment URLs signed before the removal, for at most 5 minutes.
+
+### The rewrite
+
+```ts
+const VARIANT_LINE = /^(\d{3,4}p)\/index\.m3u8$/;
+const SEGMENT_LINE = /^[\w-]+\.ts$/;
+
+masterPlaylist:  "720p/index.m3u8"  →  "720p.m3u8"
+variantPlaylist: "seg_000.ts"       →  presignGet(hls, ":id/720p/seg_000.ts", 300)
+```
+
+- **Only URI lines change.** In an `.m3u8` file, a line starting with `#` is a tag (`#EXTINF:6.0,`, `#EXT-X-ENDLIST`) and stays as it is. Any other non-empty line is a URI.
+- **A URI we don't recognize is an error,** not something to pass through unchanged. If the worker ever writes a different layout, we want a loud 500 in the logs, not a silently broken player.
+- **The variant URIs are relative** (`720p.m3u8`, not `http://localhost:4000/videos/.../720p.m3u8`). The player resolves them against the master's own URL, so the API never needs to know its public host name, and the same code works behind any domain or path prefix.
+- **The plan's sample used `v\d+`.** Our worker names renditions `1080p`, `720p`, `480p`, so the pattern is `\d{3,4}p`.
+
+### Never build a storage key from raw input
+
+The route is `/:videoId/stream/:rendition.m3u8`, and `rendition` goes into a storage key. Express decodes the path before matching it:
+
+```text
+GET /videos/:id/stream/..%2F..%2Fsecret.m3u8   →   rendition = "../../secret"
+```
+
+Without validation, that becomes the key `:id/../../secret/index.m3u8`. S3 keys are plain strings, so `..` doesn't "go up" the way it does on a disk. It's still a key we never meant to build, though, and on a filesystem-backed store it can be a real **path traversal**. The schema allows exactly two shapes and rejects everything else with a 400:
+
+```ts
+rendition: z.union([z.literal('master'), z.string().regex(/^\d{3,4}p$/)])
+```
+
+A well-formed rendition the video doesn't have (`2160p`) reaches storage, gets `NoSuchKey`, and becomes 404 `RENDITION_NOT_FOUND`.
+
+### The VOD trap: playlists are read once
+
+A playlist ending in `#EXT-X-ENDLIST` is a **VOD** (video on demand) playlist: complete and never changing, so players read it **once**. With 5-minute URLs, a viewer who watches for 6 minutes (or pauses for 5) will request a segment whose URL has expired:
+
+```text
+13.2s  error: fragLoadError 403             ← storage refuses the expired URL
+13.3s  fresh segment URLs for 1080p (20)    ← re-fetch 1080p.m3u8 through the API
+13.7s  segment 16 @ 1080p, 4.41 MB          ← hls.js retries with the new URL
+```
+
+That log is from the dev player against an API instance started with `STREAM_URL_TTL_SECONDS=10`, so the expiry shows up in seconds instead of minutes. The fix lives in the player:
+
+- **Retry on 403.** hls.js normally doesn't retry 4xx errors. A custom `fragLoadPolicy.errorRetry.shouldRetry` allows up to 3 retries for a 403.
+- **Swap in fresh URLs.** On the error, re-fetch that rendition's playlist and write the new URLs into the fragments hls.js already holds (`frag.url = ...`).
+- **What you keep.** The retry 300 ms later uses the fresh URL, so the buffer and the playback position are untouched.
+
+The first attempt reloaded the whole source with `hls.loadSource()`. It worked, but it rebuilt the player: playback jumped from 10.9 s back to 6.1 s and every segment downloaded again. Patching the URLs in place avoids both.
+
+**Why not just sign for longer?** The TTL is the window in which a **leaked** URL works. Signing for the video's whole length (2 hours) makes every copied link last 2 hours. Short URLs plus a refresh keep that window at 5 minutes and cost one small API request per 5 minutes of viewing.
+
+### Browser details that bite
+
+- **Send the token to the API only.** hls.js's `xhrSetup(xhr, url)` runs for every request, segments included. The player adds `Authorization` only when `url` starts with the API origin. **Measured:** RustFS ignores an extra `Authorization: Bearer` header on a presigned URL and returns 200. **AWS S3 doesn't:** it rejects a request that carries two auth mechanisms with 400 `InvalidArgument`. Code that only works because the local storage is lenient would break on the first deploy.
+- **CORS on the bucket.** hls.js downloads segments with XHR, and XHR to another origin needs CORS. `storage:init` now gives `hls-output` a `GET` rule for `FRONTEND_URL`, which also lists the dev player's origin (`http://localhost:4100`). Thumbnails don't need one, because an `<img>` tag isn't subject to CORS.
+- **`Cache-Control: no-store`.** A variant playlist contains URLs signed for one moment and fetched with one user's token. A browser or proxy cache that replays it later would hand out expired URLs, or another user's access.
+
+### Cost: signing isn't free
+
+`getSignedUrl` is local (no network), but the SDK builds and signs a full request object each time. **Measured:** 1,200 URLs (a 2-hour rendition of 6-second segments) took **525–916 ms**, about 0.45 ms each. The 2-minute demo's 20 segments took 39 ms for the whole request. That's fine for Phase 1. With long videos and many viewers, the API spends real CPU on signing.
+
+**Phase 2 with a CDN:** CloudFront can use **signed cookies**. The API checks membership once and sets a cookie whose policy says "this browser may read `hls-output/<videoId>/*` until 10:35". The playlists are then served unchanged straight from the CDN and cached at the edge for everyone, because the signature moves from the URLs into a cookie. No per-segment signing, no rewriting, and the same expiry guarantee.
+
+### What was tested
+
+| Case | Result |
+|---|---|
+| viewer gets `master.m3u8` | 200, `application/vnd.apple.mpegurl`, `no-store`, lines `1080p.m3u8, 720p.m3u8, 480p.m3u8`, 3 `#EXT-X-STREAM-INF` tags kept |
+| viewer gets `720p.m3u8` | 200 in 39 ms; 20 segment lines, all `http://localhost:9000/hls-output/<id>/720p/seg_…` with `X-Amz-Expires=300`; `#EXT-X-ENDLIST` kept |
+| fetch a signed segment | 200 `video/mp2t`, 2,143,576 bytes |
+| same, with an extra `Authorization: Bearer` header | 200 on RustFS (AWS S3 would return 400) |
+| storage `GET` with `Origin: http://localhost:4100` / API preflight from it | `Access-Control-Allow-Origin` set on both |
+| no token / `..%2F..%2Fsecret` / `2160p` / `seg_000.ts` | 401 / 400 / 404 `RENDITION_NOT_FOUND` / 404 (no such route) |
+| admin, ERROR video / viewer, ERROR video / unknown id | 409 `VIDEO_NOT_READY` / 404 / 404 |
+| instance with `STREAM_URL_TTL_SECONDS=10`: segment URL fresh / after 12 s | 200 / 403 `AccessDenied` |
+| dev player in API mode against that instance, in Chrome | plays; a 403 every ~12 s is followed by fresh URLs and a successful retry; playback reached 48.5 s with no restart |
