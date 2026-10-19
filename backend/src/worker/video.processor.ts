@@ -135,7 +135,7 @@ const transcode = async (job: Job<TranscodeJob>, log: Logger) => {
 
   const ready = await videoService.markVideoReady(videoId, output);
   if (!ready) throw new UnrecoverableError('Video left PROCESSING while it was being processed');
-  await notifyVideoReady(videoId);
+  await notifyVideoReady(videoId, job.data.requestId);
 
   log.info('processing complete');
   return { status: ready.status, ...output };
@@ -154,7 +154,7 @@ const failForGood = async (job: Job<TranscodeJob>, err: unknown, log: Logger) =>
 
   let deletedOutputs: number | undefined;
   if (failed) {
-    await notifyVideoFailed(videoId);
+    await notifyVideoFailed(videoId, job.data.requestId);
     deletedOutputs = await videoService.deleteVideoOutputs(videoId).catch((cleanErr: unknown) => {
       log.error({ err: cleanErr }, 'could not delete partial outputs');
       return undefined;

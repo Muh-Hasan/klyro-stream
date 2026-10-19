@@ -10,7 +10,7 @@ const oneLine = (text: string) => text.replace(/\p{Cc}+/gu, ' ').trim();
 export const videoEmailJobId = (kind: VideoEmail, videoId: string) =>
   `email-video-${kind}-${videoId}`;
 
-const queueVideoEmail = async (kind: VideoEmail, videoId: string) => {
+const queueVideoEmail = async (kind: VideoEmail, videoId: string, requestId?: string) => {
   const video = await videoRepo.findWithUploader(videoId);
   if (!video) return;
 
@@ -27,14 +27,16 @@ const queueVideoEmail = async (kind: VideoEmail, videoId: string) => {
           subject: `"${title}" could not be processed`,
           text: `We couldn't process your video "${title}".\n\nReason: ${video.errorMessage ?? 'unknown'}\n\nYou can delete it and upload the file again.\n`,
         };
-  await enqueueEmail(mail, videoEmailJobId(kind, video.id));
+  await enqueueEmail({ ...mail, requestId }, videoEmailJobId(kind, video.id));
 };
 
-const notify = (kind: VideoEmail, videoId: string) =>
-  queueVideoEmail(kind, videoId).catch((err: unknown) =>
+const notify = (kind: VideoEmail, videoId: string, requestId?: string) =>
+  queueVideoEmail(kind, videoId, requestId).catch((err: unknown) =>
     logger.error({ err, videoId, kind }, 'could not queue the video email'),
   );
 
-export const notifyVideoReady = (videoId: string) => notify('ready', videoId);
+export const notifyVideoReady = (videoId: string, requestId?: string) =>
+  notify('ready', videoId, requestId);
 
-export const notifyVideoFailed = (videoId: string) => notify('failed', videoId);
+export const notifyVideoFailed = (videoId: string, requestId?: string) =>
+  notify('failed', videoId, requestId);

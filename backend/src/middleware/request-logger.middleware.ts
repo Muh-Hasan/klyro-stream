@@ -16,6 +16,8 @@ const pathOf = (url: string | undefined) => url?.split('?')[0] ?? '';
 
 export const requestLogger = pinoHttp({
   logger,
+  quietReqLogger: true,
+  customAttributeKeys: { reqId: 'requestId' },
   genReqId: (req, res) => {
     const incoming = req.headers[HEADER];
     const id = typeof incoming === 'string' && incoming.length <= 128 ? incoming : randomUUID();

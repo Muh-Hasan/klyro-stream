@@ -2,6 +2,8 @@ import { Worker } from 'bullmq';
 import { env } from './config/env.js';
 import { closeDb } from './lib/db/client.js';
 import { closeMailer } from './lib/mail/mailer.js';
+import { initObservability } from './lib/metrics/registry.js';
+import { closeMetricsServer, startMetricsServer } from './lib/metrics/server.js';
 import { closeQueueConnections, queueConnection } from './lib/queue/connection.js';
 import {
   closeQueues,
@@ -12,11 +14,14 @@ import {
 } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
 import { logger } from './utils/logger.js';
+import { instrument } from './worker/metrics.js';
 import { processEmail } from './worker/notification.processor.js';
 import { processVideo, stopActiveJobs } from './worker/video.processor.js';
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 const EMAIL_CONCURRENCY = 5;
+
+initObservability('worker');
 
 const videoWorker = new Worker<TranscodeJob>(VIDEO_QUEUE, processVideo, {
   connection: queueConnection('worker'),
@@ -46,6 +51,10 @@ emailWorker.on('failed', (job, err) => {
 });
 emailWorker.on('error', (err) => logger.error({ err, queue: NOTIFICATION_QUEUE }, 'worker error'));
 
+instrument(videoWorker);
+instrument(emailWorker);
+const metricsServer = startMetricsServer(env.WORKER_METRICS_PORT);
+
 let shuttingDown = false;
 
 const shutdown = async (reason: string, exitCode = 0) => {
@@ -69,6 +78,7 @@ const shutdown = async (reason: string, exitCode = 0) => {
   logger.info('worker closed');
 
   const results = await Promise.allSettled([
+    closeMetricsServer(metricsServer),
     closeQueues().finally(closeQueueConnections),
     closeDb(),
     closeRedis(),

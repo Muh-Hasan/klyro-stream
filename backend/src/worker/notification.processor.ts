@@ -4,9 +4,10 @@ import type { EmailJob } from '../lib/queue/queues.js';
 import { logger } from '../utils/logger.js';
 
 export const processEmail = async (job: Job<EmailJob>) => {
-  const log = logger.child({ jobId: job.id, attempt: job.attemptsMade + 1 });
+  const { requestId, ...mail } = job.data;
+  const log = logger.child({ jobId: job.id, requestId, attempt: job.attemptsMade + 1 });
   try {
-    await sendMail(job.data);
+    await sendMail(mail);
   } catch (err) {
     log.warn({ err }, 'email not sent, will retry');
     throw err;

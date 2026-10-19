@@ -22,7 +22,7 @@ export type TranscodeJob = {
   output?: TranscodeOutput;
 };
 
-export type EmailJob = { to: string; subject: string; text: string };
+export type EmailJob = { to: string; subject: string; text: string; requestId?: string };
 
 export const videoQueue = new Queue<TranscodeJob>(VIDEO_QUEUE, {
   connection: queueConnection('producer'),
