@@ -2,6 +2,8 @@
 
 Sprint 7 turns stored videos into a product: a club can browse its library, search it, watch a video and download it until its quota runs out. This guide grows one section per stage. The query plans and timings below were **measured on this project**.
 
+**Reviewing Sprint 7?** Read sections 1–5 for the concepts, sections 6–11 for each stage and how it was tested, then [section 12](#12-code-walkthrough-reviewing-sprint-7) with the code open: it goes through every file in reading order and ends with a review checklist.
+
 Related: [indexes.md](indexes.md) (how B-tree indexes work) · [transactions.md](transactions.md) (atomic updates, locks) · [transcoding.md](transcoding.md) (what's in the `hls-output` bucket) · [uploads.md](uploads.md) (presigned upload URLs).
 
 **Contents**
@@ -17,6 +19,7 @@ Related: [indexes.md](indexes.md) (how B-tree indexes work) · [transactions.md]
 9. [Stage 5: signed HLS streaming](#9-stage-5-signed-hls-streaming)
 10. [Stage 6: downloads and an atomic quota](#10-stage-6-downloads-and-an-atomic-quota)
 11. [Stage 7: reading and raising the quota](#11-stage-7-reading-and-raising-the-quota)
+12. [Code walkthrough: reviewing Sprint 7](#12-code-walkthrough-reviewing-sprint-7)
 
 ---
 
@@ -884,3 +887,626 @@ The upper bound isn't a business rule. It keeps the value well inside Postgres `
 | 12 wrong passwords | 401 × 10, then 429 |
 
 The tests restored the quota to `limit 100, used 0` and removed their log rows.
+
+
+---
+
+## 12. Code walkthrough: reviewing Sprint 7
+
+This section goes through **every file Sprint 7 added or changed**, in the order that makes them easiest to follow: from what arrives over HTTP, down to storage, and back out. For each file: what it's for, the code that matters, why it's written that way, and how to check it yourself. Sections 6–11 explain the concepts; this one is for reading the code with the files open.
+
+### Reading order
+
+```mermaid
+flowchart TD
+    A["1 · routes: index, clubs, videos, admin"] --> B["2 · validators: video.schema, quota.schema<br/>+ validate.middleware fix"]
+    B --> C["3 · controllers: video, quota"]
+    C --> D["4 · video.service: visibility, list, get, edit, delete"]
+    D --> E["5 · video.repository: list, details, remove"]
+    D --> F["6 · stream.service: playlist rewriting"]
+    D --> G["7 · download.service + download.repository"]
+    G --> H["8 · quota.service"]
+    F --> I["9 · lib/storage/objects.ts, lib/queue/queues.ts"]
+    G --> I
+    I --> J["10 · schema.ts + migrations 0003, 0004"]
+    J --> K["11 · rate-limit, storage-init, env"]
+    K --> L["12 · worker + hls-player (dev tool)"]
+```
+
+| # | File | Change | Kind |
+|---|---|---|---|
+| 1 | `routes/index.ts`, `clubs.routes.ts`, `videos.routes.ts`, `admin.routes.ts` | +50 | Wiring: which middleware guards which path |
+| 2 | `validators/video.schema.ts`, `validators/quota.schema.ts`, `middleware/validate.middleware.ts` | +110 | Input shapes; the allow-list for every field |
+| 3 | `controllers/video.controller.ts`, `controllers/quota.controller.ts` | +64 | HTTP in, HTTP out; no rules |
+| 4 | `services/video.service.ts` | +123 | Access rules, list, get, edit, delete |
+| 5 | `repositories/video.repository.ts` | +69 | SQL for the list, details and delete |
+| 6 | `services/stream.service.ts` | 65, new | Playlist rewriting and signing |
+| 7 | `services/download.service.ts`, `repositories/download.repository.ts` | 113, new | Filename, quota transaction, signed attachment |
+| 8 | `services/quota.service.ts` | 32, new | Read and set a limit |
+| 9 | `lib/storage/objects.ts`, `lib/queue/queues.ts` | +38 | `readText`, `presignGet` with a disposition, `DeleteObjects` errors, job removal |
+| 10 | `lib/db/schema.ts`, `drizzle/0003_*.sql`, `drizzle/0004_*.sql` | +8 | Resolution columns; history that survives deletes |
+| 11 | `middleware/rate-limit.middleware.ts`, `scripts/storage-init.ts`, `config/env.ts` | +15 | 401-only admin limiter; CORS for HLS; segment TTL |
+| 12 | `worker/video.processor.ts`, `scripts/hls-player.ts` | +81 | Width and height saved; API mode with URL refresh |
+
+### The layering rule
+
+```mermaid
+flowchart LR
+    RT["routes<br/><b>who may enter</b><br/>requireAuth, requireClubRole, basicAuth"] --> V["validate<br/><b>what may enter</b>"]
+    V --> CT["controllers<br/><b>HTTP only</b>"]
+    CT --> SV["services<br/><b>rules</b><br/>visibility, manage, READY, quota errors"]
+    SV --> RP["repositories<br/><b>SQL</b><br/>the only db importers"]
+    SV --> LB["lib/storage, lib/queue<br/><b>S3 and Redis</b>"]
+```
+
+Each layer only calls the one to its right. Two consequences you can see in this sprint:
+
+- **The repository returns `undefined`, the service throws.** `consumeQuotaAndLog` returns `undefined` when the quota is used up; `createDownload` turns that into 403 `QUOTA_EXCEEDED`. The repository knows SQL, not HTTP.
+- **One service rule, many endpoints.** `requireVisible` is defined once in `video.service.ts` and called by get, edit, delete, both stream routes and download.
+
+---
+
+### 1. Routes: who may enter
+
+#### `routes/videos.routes.ts`
+
+```ts
+videosRouter.use(requireAuth);
+
+videosRouter.get('/:videoId', validate(getVideoSchemas), videoController.get);
+videosRouter.patch('/:videoId', validate(updateVideoSchemas), videoController.update);
+videosRouter.delete('/:videoId', validate(deleteVideoSchemas), videoController.remove);
+videosRouter.post('/:videoId/download', validate(downloadVideoSchemas), videoController.download);
+videosRouter.get('/:videoId/stream/:rendition.m3u8', validate(streamSchemas), videoController.stream);
+```
+
+- **No `requireClubRole` here.** The URL doesn't name a club, so membership can only be checked after loading the video. That happens in the service (`requireVisible`, section 4). Forgetting it would be an IDOR (section 7).
+- **`:rendition.m3u8`.** Express 5's router reads `rendition` as the parameter and `.m3u8` as literal text, so `/stream/720p.m3u8` gives `rendition = "720p"` and `/stream/seg_000.ts` matches no route (404). One route serves both `master` and the variants.
+- **`POST` for download** because it changes state (quota, log).
+
+#### `routes/clubs.routes.ts`
+
+```ts
+clubsRouter.get('/:clubId/videos', validate(listVideosSchemas), requireClubRole('viewer'), videoController.list);
+clubsRouter.get('/:clubId/quota', validate(getQuotaSchemas), requireClubRole('viewer'), quotaController.get);
+```
+
+`validate` runs **before** `requireClubRole`, so `/clubs/not-a-uuid/quota` is a 400 and never reaches the database. `requireClubRole` puts `{ clubId, role }` into `res.locals.membership`, and the controllers read it with `currentMembership(res)`.
+
+#### `routes/admin.routes.ts` and `routes/index.ts`
+
+```ts
+export const ADMIN_PATH = '/admin';
+export const BULL_BOARD_PATH = `${ADMIN_PATH}/queues`;
+
+router.use(adminLimiter, basicAuth(user, password, 'KlyroStream admin'));
+router.use('/queues', serverAdapter.getRouter() as Router);
+router.patch('/clubs/:clubId/quota', validate(setQuotaLimitSchemas), quotaController.setLimit);
+```
+
+```ts
+if (adminRouter) routes.use(ADMIN_PATH, adminRouter);
+```
+
+The router used to be mounted at `/admin/queues`. Mounting it one level up puts the limiter and Basic auth in front of **everything** under `/admin`. Bull Board still lives at `/admin/queues`, because `setBasePath(BULL_BOARD_PATH)` tells it its full public path for the links in its HTML. If the `BULL_BOARD_*` variables are empty, `adminRouter` is `undefined` and the whole `/admin` area, quota included, doesn't exist (404).
+
+**Check it yourself:** `curl -i -X PATCH localhost:4000/admin/clubs/<id>/quota` → 401 with `WWW-Authenticate: Basic realm="KlyroStream admin"`.
+
+---
+
+### 2. Validators: what may enter
+
+#### `validators/video.schema.ts`
+
+```ts
+export const listVideosSchemas = {
+  params: clubParams,
+  query: paginationQuery.extend({
+    status: z.enum(videoStatusEnum.enumValues, { error: `The status must be one of: ...` }).optional(),
+    q: z.string().trim().max(MAX_SEARCH_LENGTH, ...).optional().transform((q) => q || undefined),
+  }),
+};
+```
+
+- **`paginationQuery` is shared** (`page` ≥ 1, `limit` 1–50, both coerced from strings, since everything in a query string is text). `.extend` adds the video-specific filters.
+- **`status` comes from the database enum** (`videoStatusEnum.enumValues`), so adding a status in `schema.ts` updates the validator and its error message.
+- **`q || undefined`:** `?q=` and `?q=%20%20` trim to `""`, which becomes "no search" instead of `ILIKE '%%'`.
+
+```ts
+export const updateVideoSchemas = {
+  params: videoParams,
+  body: z
+    .object({
+      title: title.optional(),
+      description: description.nullable().optional().transform((d) => (d === '' ? null : d)),
+    })
+    .refine((body) => body.title !== undefined || body.description !== undefined, {
+      error: 'Send a title, a description, or both.',
+    }),
+};
+```
+
+The object lists the **only** two fields a client may change. Zod drops every other key, which is what stops mass assignment (section 7). `title` and `description` are shared consts, so the create and edit rules can't drift apart.
+
+```ts
+export const streamSchemas = {
+  params: videoParams.extend({
+    rendition: z.union([z.literal('master'), z.string().regex(/^\d{3,4}p$/, 'Expected master or a rendition such as 720p')]),
+  }),
+};
+```
+
+This is the line that makes `..%2F..%2Fsecret` a 400 (section 9). `rendition` is the only route parameter in the codebase that ends up inside a storage key, so it gets the strictest pattern.
+
+#### `validators/quota.schema.ts`
+
+```ts
+limit: z
+  .number({ error: (issue) => (issue.input === undefined ? 'The limit is required.' : 'The limit must be a number.') })
+  .int('The limit must be a whole number.')
+  .min(0, 'The limit cannot be negative.')
+  .max(MAX_QUOTA_LIMIT, `The limit must be at most ${MAX_QUOTA_LIMIT}.`),
+```
+
+`z.number()`, not `z.coerce.number()`: a JSON body has real numbers, so `"5"` is a client bug worth reporting, unlike a query string where everything is text. The error function tells "missing" apart from "wrong type", the same way `club.schema.ts` does for names.
+
+#### `middleware/validate.middleware.ts`: the fix
+
+```ts
+const { formErrors, fieldErrors } = z.flattenError(result.error);
+issues[part] = formErrors.length > 0 ? { _errors: formErrors, ...fieldErrors } : fieldErrors;
+```
+
+Zod reports errors about the whole object (a `refine` on it, or "expected object, received array") in `formErrors`. The middleware only returned `fieldErrors`, so those messages vanished on every route (section 7). Field errors keep their old shape, so nothing that worked before changes.
+
+---
+
+### 3. Controllers: HTTP only
+
+```ts
+export const stream: RequestHandler = async (req, res) => {
+  const { params } = getInput<typeof streamSchemas>(res);
+  const userId = currentUser(req).id;
+  const playlist =
+    params.rendition === 'master'
+      ? await streamService.masterPlaylist(params.videoId, userId)
+      : await streamService.variantPlaylist(params.videoId, params.rendition, userId);
+  res.set('Cache-Control', 'no-store').type('application/vnd.apple.mpegurl').send(playlist);
+};
+
+export const remove: RequestHandler = async (req, res) => {
+  const { params } = getInput<typeof deleteVideoSchemas>(res);
+  await videoService.deleteVideo(params.videoId, currentUser(req).id);
+  res.status(204).end();
+};
+```
+
+Every controller has the same three steps: read validated input with `getInput<typeof schemas>(res)`, which is typed from the same schema object the route used; call one service function; pick the status and headers. The controller is the only place that knows a playlist is `application/vnd.apple.mpegurl` or that a delete answers `204`. The service returns plain values and could serve a CLI or a queue job unchanged.
+
+`quota.controller.ts` reads the club from `currentMembership(res).clubId` for the member route, because `requireClubRole` already proved membership, and from `params.clubId` for the admin route, where no membership exists.
+
+---
+
+### 4. `services/video.service.ts`: the access rules
+
+#### Who sees what
+
+```ts
+const UPLOADER_ROLES: readonly ClubRole[] = ['club_owner', 'admin'];
+
+const visibleStatuses = (role: ClubRole): readonly VideoStatus[] =>
+  UPLOADER_ROLES.includes(role) ? videoStatusEnum.enumValues : ['READY'];
+```
+
+One function decides visibility for the list **and** for every single-video route. That's why a viewer can't open by id a `PROCESSING` video the list wouldn't show them.
+
+#### `listVideos`
+
+```ts
+const visible = visibleStatuses(role);
+const statuses = status ? visible.filter((s) => s === status) : visible;
+if (statuses.length === 0) return paginated([], 0, page, limit);
+```
+
+A viewer asking for `?status=ERROR` gets an empty page, not a 403. The filter narrows what you're allowed to see; it can't widen it. The early return skips a query that couldn't match anything. Thumbnails are signed per row after the query (signing is local, microseconds each).
+
+#### `requireVisible` and `canManage`
+
+```ts
+export const requireVisible = async <T extends Pick<Video, 'clubId' | 'status'>>(video: T | undefined, userId: string) => {
+  if (!video) throw videoNotFound();
+  const role = await clubRepo.getMemberRole(video.clubId, userId);
+  if (!role || !visibleStatuses(role).includes(video.status)) throw videoNotFound();
+  return { video, role };
+};
+
+const canManage = (video: Pick<Video, 'uploadedBy'>, role: ClubRole, userId: string) =>
+  role === 'admin' || (video.uploadedBy === userId && UPLOADER_ROLES.includes(role));
+```
+
+- **Generic over the row type.** It accepts a `Video` or a `Video & { uploader }` and returns the same type, so callers keep the fields they loaded.
+- **Three different reasons, one 404.** "No such video", "not your club" and "not visible to your role" all look the same from outside (section 7).
+- **`canManage` checks the current role.** A demoted uploader loses edit and delete rights.
+
+It's exported because `stream.service.ts` and `download.service.ts` start with it too.
+
+#### `deleteVideo`
+
+```ts
+export const deleteVideo = async (videoId: string, userId: string) => {
+  const { video, role } = await requireVisible(await videoRepo.findById(videoId), userId);
+  if (!canManage(video, role, userId)) throw new ForbiddenError('You do not have permission to delete this video');
+
+  if (video.status === 'UPLOADING') await abortLockedUpload(videoId, 'Video deleted');
+
+  if (!(await removeTranscodeJob(videoId))) {
+    throw new ConflictError('This video is being processed. Try again when processing finishes.', 'VIDEO_PROCESSING');
+  }
+
+  const [raw, outputs] = await Promise.all([
+    deletePrefix(BUCKETS.raw, rawPrefix(video.clubId, videoId)),
+    deleteVideoOutputs(videoId),
+  ]);
+  if (!(await videoRepo.remove(videoId))) throw videoNotFound();
+  logger.info({ videoId, status: video.status, rawObjects: raw, hlsObjects: outputs }, 'video deleted');
+};
+```
+
+Read it from top to bottom against the flowchart in section 8:
+
+1. **`abortLockedUpload` is reused from Sprint 4.** It takes the row lock, aborts the multipart upload, and moves the row to `ERROR`. If `complete` won the race, the row is no longer `UPLOADING`, the lock query finds nothing, and the function returns `undefined`, which delete ignores and carries on.
+2. **`removeTranscodeJob` is the 409 check** and the job removal in one atomic Redis call. It runs for every status: `READY` and `ERROR` videos still have completed or failed jobs kept for Bull Board.
+3. **The three buckets are cleaned in parallel.** They're independent, and `deleteVideoOutputs` (from Sprint 6) already did HLS plus thumbnail.
+4. **The row goes last.** `remove` returning nothing means someone else deleted it in the meantime, so 404, the same answer they'd get a moment later.
+
+`rawKey` now builds on `rawPrefix`, so the upload key and the delete prefix can't disagree:
+
+```ts
+const rawPrefix = (clubId: string, videoId: string) => `clubs/${clubId}/videos/${videoId}/`;
+const rawKey = (clubId: string, videoId: string, ext: string) => `${rawPrefix(clubId, videoId)}original.${ext}`;
+```
+
+#### `toVideoResponse`
+
+```ts
+resolution: video.width && video.height ? { width: video.width, height: video.height } : null,
+```
+
+Width and height are stored in two columns but returned as one value or `null`. A client never has to handle "width but no height".
+
+---
+
+### 5. `repositories/video.repository.ts`: the SQL
+
+```ts
+const escapeLike = (text: string) => text.replace(/[\\%_]/g, '\\$&');
+
+export const listForClub = async ({ clubId, statuses, search }: VideoListFilter, limit: number, offset: number) => {
+  const where = and(
+    eq(videos.clubId, clubId),
+    inArray(videos.status, [...statuses]),
+    search ? ilike(videos.title, `%${escapeLike(search)}%`) : undefined,
+  );
+  const [items, [total]] = await Promise.all([
+    db.query.videos.findMany({ columns: { ... }, where, orderBy: [desc(videos.createdAt), desc(videos.id)], limit, offset }),
+    db.select({ value: count() }).from(videos).where(where),
+  ]);
+  return { items, total: total?.value ?? 0 };
+};
+```
+
+- **`escapeLike`** escapes the backslash first (it's in the same character class, so one pass handles all three). `$&` means "the matched character" (section 3).
+- **One `where` object for both queries,** so the page and the count can't disagree about what they're counting.
+- **`desc(videos.id)` as a tie-breaker.** Two videos created in the same millisecond would otherwise swap places between pages.
+- **`db.query` for rows, `db.select` for the count**, following the project rule: entity fetches use the query builder, aggregates use `select`.
+- **`columns: {...}`** lists only what a list item needs. `raw_path`, `upload_id` and `error_message` never leave the database for a list.
+
+```ts
+export const remove = async (id: string) => {
+  const [deleted] = await db.delete(videos).where(eq(videos.id, id)).returning({ id: videos.id });
+  return deleted;
+};
+```
+
+`returning({ id })` makes "did anything get deleted?" a value the service can check, without a second query.
+
+---
+
+### 6. `services/stream.service.ts`: rewriting playlists
+
+```ts
+const VARIANT_LINE = /^(\d{3,4}p)\/index\.m3u8$/;
+const SEGMENT_LINE = /^[\w-]+\.ts$/;
+
+const requirePlayable = async (videoId: string, userId: string) => {
+  const { video } = await requireVisible(await videoRepo.findById(videoId), userId);
+  if (video.status !== 'READY' || !video.hlsPath) throw new ConflictError('This video is not ready to play yet', 'VIDEO_NOT_READY');
+  return video;
+};
+```
+
+A viewer never reaches the 409: for them a non-READY video is already a 404 from `requireVisible`. Only owners and admins, who can see a `PROCESSING` video, get the more useful "not ready yet".
+
+```ts
+const isUri = (line: string) => line !== '' && !line.startsWith('#');
+
+const variantRoute = (line: string) => {
+  const variant = VARIANT_LINE.exec(line)?.[1];
+  if (!variant) throw unexpected(line);
+  return `${variant}.m3u8`;
+};
+
+const signSegment = (videoId: string, rendition: string, line: string) => {
+  if (!SEGMENT_LINE.test(line)) throw unexpected(line);
+  return presignGet(BUCKETS.hls, `${videoId}/${rendition}/${line}`, env.STREAM_URL_TTL_SECONDS);
+};
+```
+
+- **Master rewriting is synchronous and the variant rewriting is async,** because only signing returns a promise. An earlier draft forced both through one async helper, and ESLint flagged it (`await-thenable`, `require-await`): the shared helper was hiding that one of the two had nothing to wait for.
+- **`signSegment` validates the line from storage too.** The playlist was written by our own worker, but the service still refuses to sign a key it didn't expect.
+- **`lines(text)` splits on `\r?\n`,** so a playlist saved with Windows line endings still parses.
+
+```ts
+const signed = await Promise.all(
+  lines(text).map((line) => (isUri(line) ? signSegment(video.id, rendition, line) : Promise.resolve(line))),
+);
+```
+
+All signatures are computed concurrently, and `Promise.all` keeps the original order, so `#EXTINF` lines stay next to their segments.
+
+---
+
+### 7. Downloads: `download.service.ts` and `download.repository.ts`
+
+#### The transaction
+
+```ts
+export const consumeQuotaAndLog = (record: DownloadRecord) =>
+  db.transaction(async (tx) => {
+    const [quota] = await tx
+      .update(downloadQuotas)
+      .set({ usedCount: sql`${downloadQuotas.usedCount} + 1` })
+      .where(and(eq(downloadQuotas.clubId, record.clubId), lt(downloadQuotas.usedCount, downloadQuotas.quotaLimit)))
+      .returning({ limit: downloadQuotas.quotaLimit, used: downloadQuotas.usedCount });
+    if (!quota) return undefined;
+
+    await tx.insert(downloadLogs).values(record);
+    return quota;
+  });
+```
+
+- **`sql\`${downloadQuotas.usedCount} + 1\``** makes Postgres compute the new value from the row it has locked, not from a number Node read earlier (row B in section 10's table).
+- **`lt(usedCount, quotaLimit)` compares two columns,** so the check uses the limit as it is at that instant, even if an operator just changed it.
+- **`tx`, never `db`, inside the callback.** `db` would run the insert on another connection, outside the transaction.
+
+#### The service
+
+```ts
+export const createDownload = async (videoId: string, userId: string) => {
+  const { video } = await requireVisible(await videoRepo.findById(videoId), userId);
+  if (video.status !== 'READY' || !video.rawPath) throw new ConflictError('This video is not ready to download yet', 'VIDEO_NOT_READY');
+  const sizeBytes = await storedSize(video.rawPath);
+
+  const quota = await downloadRepo.consumeQuotaAndLog({ clubId: video.clubId, videoId: video.id, userId });
+  if (!quota) throw new ForbiddenError('This club has used its download quota', 'QUOTA_EXCEEDED');
+
+  const filename = downloadFilename(video.title, video.rawPath);
+  const url = await presignGet(BUCKETS.raw, video.rawPath, DOWNLOAD_URL_TTL_SECONDS, attachment(filename));
+  return { download: { url, filename, sizeBytes, expiresAt: ... }, quota: toQuota(quota) };
+};
+```
+
+The order is cheapest and safest first: access, status, file exists (a `HeadObject`, which translates `NotFound` into 404 `VIDEO_FILE_MISSING`), **then** charge, **then** sign. Nothing slow or remote runs while the quota row is locked.
+
+#### Filenames
+
+```ts
+export const downloadFilename = (title: string, rawPath: string) => {
+  const base = title
+    .replace(/[\p{Cc}<>:"/\\|?*]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+|\.+$/g, '')
+    .slice(0, MAX_FILENAME_LENGTH)
+    .trim();
+  return `${base || 'video'}${path.extname(rawPath)}`;
+};
+```
+
+- `\p{Cc}` is the Unicode class "control character", which covers `\r`, `\n`, `\t` and `\0`. It needs the `u` flag.
+- Bad characters become **spaces**, not nothing, so `final/cut` reads as `final cut`, not `finalcut`. The next line collapses the runs of spaces.
+- Leading and trailing dots are removed: a name like `.mp4` would be a hidden file on Unix, and Windows strips trailing dots silently.
+- `slice` happens **after** cleaning, so the limit counts the characters that will actually be in the name. The second `trim` removes a space the cut may have left at the end.
+
+```ts
+export const attachment = (filename: string) => {
+  const ascii = filename.replace(/[^\x20-\x7e]/g, '_');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeRfc5987(filename)}`;
+};
+```
+
+`attachment` trusts its input to be already cleaned (no `"` or `\`). That's why it's only ever called with the result of `downloadFilename`.
+
+---
+
+### 8. `services/quota.service.ts`
+
+```ts
+export const toQuota = ({ limit, used }: { limit: number; used: number }) => ({
+  limit,
+  used,
+  remaining: Math.max(0, limit - used),
+});
+```
+
+The download response and both quota endpoints use this one function, so `remaining` is computed and clamped the same way everywhere. `setQuotaLimit` logs every change with the club id, the new limit and the current usage. That's the audit trail for an operator action.
+
+---
+
+### 9. Storage and queue helpers
+
+#### `lib/storage/objects.ts`
+
+```ts
+export const readText = async (bucket: string, key: string): Promise<string> => {
+  const { Body } = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  if (!Body) throw new Error(`GetObject ${key} returned no body`);
+  return Body.transformToString();
+};
+
+export const presignGet = (bucket: string, key: string, expiresIn: number, contentDisposition?: string): Promise<string> =>
+  getSignedUrl(s3Public, new GetObjectCommand({ Bucket: bucket, Key: key, ResponseContentDisposition: contentDisposition }), { expiresIn });
+```
+
+- **`readText` uses `s3`, `presignGet` uses `s3Public`.** The API reads playlists over the internal endpoint. URLs handed to browsers must be signed for the host the browser will use (section 5).
+- **`ResponseContentDisposition: undefined`** adds nothing to the URL, so thumbnails and segments are signed exactly as before.
+- **`deletePrefix` now checks `Errors`** from `DeleteObjects` and throws (section 8).
+
+#### `lib/queue/queues.ts`
+
+```ts
+export const removeTranscodeJob = async (videoId: string) =>
+  (await videoQueue.remove(transcodeJobId(videoId))) === 1;
+```
+
+`true` means "removed, or there was nothing to remove". `false` means a worker holds the lock. The deterministic job id from Sprint 5 (`video-<id>`) is what makes this possible: the API can find a video's job without storing a job id anywhere.
+
+---
+
+### 10. Schema and migrations
+
+```ts
+width: integer('width'),
+height: integer('height'),
+```
+
+```ts
+clubId: uuid('club_id').notNull().references(() => clubs.id, { onDelete: 'cascade' }),
+videoId: uuid('video_id').references(() => videos.id, { onDelete: 'set null' }),
+...
+index('download_logs_club_downloaded_idx').on(t.clubId, t.downloadedAt),
+```
+
+- **`0003_video_resolution`** adds two nullable columns. It's safe on any table: no default, no rewrite.
+- **`0004_download_logs_keep_history`** was **hand-edited** before it was applied, from `ADD COLUMN … NOT NULL` to add, backfill, set NOT NULL (section 10). The rule is "never edit an *applied* migration". Fixing a generated file that nobody has run yet is normal review work.
+- **Why `club_id` and not just `video_id SET NULL`:** a log row with `video_id = NULL` and nothing else would belong to no one. `club_id` keeps it attached to the club whose quota it used.
+
+---
+
+### 11. Configuration
+
+#### `middleware/rate-limit.middleware.ts`
+
+```ts
+const limiter = (name: string, limit: number, windowMs: number, authFailuresOnly = false) =>
+  rateLimit({
+    windowMs,
+    limit,
+    skipSuccessfulRequests: authFailuresOnly,
+    requestWasSuccessful: (_req, res) => res.statusCode !== 401,
+    ...
+```
+
+The parameter was renamed from `countFailuresOnly` to `authFailuresOnly` because its meaning changed: it now counts only rejected credentials (section 11). For the limiters that pass `false` nothing changes, because express-rate-limit only calls `requestWasSuccessful` when one of the skip options is on.
+
+#### `scripts/storage-init.ts`
+
+```ts
+await allowBrowser(BUCKETS.raw, ['PUT', 'GET']);
+await allowBrowser(BUCKETS.hls, ['GET']);
+```
+
+The single-purpose `allowBrowserUploads` became `allowBrowser(bucket, methods)`, and each bucket gets only the methods a browser needs: uploads `PUT` raw parts, the player `GET`s segments. Re-run `npm run storage:init` after changing `FRONTEND_URL`.
+
+#### `config/env.ts` and `.env.example`
+
+```ts
+STREAM_URL_TTL_SECONDS: z.coerce.number().int().min(10).max(3600).default(300),
+```
+
+It's configurable mainly so the expiry can be **tested** in seconds (section 9). The bounds stop a typo like `3000000` from silently turning short-lived URLs into month-long ones. `FRONTEND_URL` in `.env.example` now also lists the dev player's origin, `http://localhost:4100`.
+
+---
+
+### 12. The worker and the dev player
+
+#### `worker/video.processor.ts`
+
+```ts
+return {
+  hlsPath: keys.hlsPath,
+  thumbnailPath: keys.thumbnailPath,
+  durationSeconds: Math.round(meta.durationSeconds),
+  width: meta.width,
+  height: meta.height,
+};
+```
+
+`probe` already produced these, with rotation applied. `TranscodeOutput` marks them optional (`width?: number`), so a job checkpointed by the **old** worker (its `job.data.output` has no width) still type-checks and completes; that video just gets `resolution: null`.
+
+#### `scripts/hls-player.ts`: API mode
+
+```js
+const hls = new Hls({
+  xhrSetup: (xhr, url) => {
+    if (API && url.startsWith(API + '/')) xhr.setRequestHeader('Authorization', bearer());
+  },
+  fragLoadPolicy: {
+    default: {
+      ...fragPolicy,
+      errorRetry: {
+        ...fragPolicy.errorRetry,
+        retryDelayMs: 300,
+        shouldRetry: (config, count, timeout, response, retry) =>
+          retry || Boolean(API && response && response.code === 403 && count < 3),
+      },
+    },
+  },
+});
+```
+
+```js
+const refreshSegmentUrls = (index) => {
+  if (refreshing.has(index)) return;
+  const level = hls.levels[index];
+  const job = fetch(level.uri, { headers: { Authorization: bearer() } })
+    .then((res) => (res.ok ? res.text() : Promise.reject(new Error('playlist ' + res.status))))
+    .then((text) => {
+      const urls = text.split('\n').filter((line) => line && !line.startsWith('#'));
+      level.details.fragments.forEach((frag, i) => (frag.url = urls[i]));
+      ...
+```
+
+- **`...fragPolicy` spreads hls.js's defaults** and overrides only the retry rule, so timeouts and backoff stay as tested upstream.
+- **`retry || …`:** `retry` is hls.js's own decision. We keep it and add one case: a 403 in API mode.
+- **`refreshing` is a `Map` keyed by level.** Several segments of one rendition can fail at once, and they share one playlist fetch.
+- **`frag.url = urls[i]`** relies on the playlist keeping the same segments in the same order, which is true for a VOD playlist our worker wrote.
+- **The `api` query parameter is checked on the server** (`^http://localhost:\d{2,5}$`) before it's written into the page's `<script>`. Otherwise `?api=</script><script>…` would be a reflected XSS, even in a dev tool.
+
+---
+
+### Review checklist
+
+Use this when reading the diff (`git diff a69a7e0~1 HEAD -- backend/src`: 23 files, +724 / −46) or before changing anything here:
+
+- [ ] Every `/videos/:id` handler starts with `requireVisible`. A new one that doesn't is an IDOR.
+- [ ] Every user-controlled string that reaches SQL `LIKE`, a storage key or a response header goes through `escapeLike`, a strict regex, or `downloadFilename` respectively.
+- [ ] No storage or network call runs inside `db.transaction` (`consumeQuotaAndLog` does SQL only; `withUploadLock`'s single S3 abort is the documented exception).
+- [ ] Anything that "checks then changes" is one statement (`UPDATE … WHERE … RETURNING`, `Queue.remove`) or holds a lock across both steps.
+- [ ] URLs signed for browsers use `s3Public`, with the shortest TTL the use case allows: segments 5 min, thumbnails 10 min, downloads 5 min.
+- [ ] Repositories return values; services throw `AppError`s; controllers only pick statuses and headers.
+- [ ] New admin routes go inside `createAdminRouter`, after `basicAuth`.
+- [ ] A new migration has been read before it was applied, especially any `NOT NULL` without a default.
+
+### Known gaps and follow-ups
+
+| Gap | Why it's acceptable now | What would fix it |
+|---|---|---|
+| Offset pagination | page 40 of 50k rows costs 1.94 ms | keyset pagination on `(created_at, id)` (section 2) |
+| `ILIKE '%q%'` can't use a B-tree | filtered within one club's rows | `pg_trgm` GIN index (section 3) |
+| Delete runs in the request (8.2 s for 2,500 objects) | videos are short in Phase 1 | `DELETING` status + background job + `202` |
+| Signing every segment costs ~0.45 ms each | 39 ms for a 2-minute video | CloudFront signed cookies (section 9) |
+| Quota never resets; retries use quota | per the sprint decision | `period_start` + reset; `Idempotency-Key` |
+| Admin credentials are named `BULL_BOARD_*` | renaming breaks every `.env` | rename to `ADMIN_*` with a fallback period |
+| The 26 seeded READY rows have no real HLS or thumbnail files | they exist to test lists, filters and query plans | delete them, or re-seed from real uploads |
+| The worker image in Docker predates `width`/`height` | the host worker (`npm run dev:worker`) has it | `docker compose --profile worker up -d --build worker` when online |
