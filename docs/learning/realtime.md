@@ -15,8 +15,8 @@ Related: [queues.md](queues.md) (BullMQ, workers, retries) · [transcoding.md](t
 7. [Stage 3: rooms, and who hears what](#7-stage-3-rooms-and-who-hears-what)
 8. [Stage 4: relaying worker events](#8-stage-4-relaying-worker-events)
 9. [Stage 5: email through a queue](#9-stage-5-email-through-a-queue)
-
-Coming in later stages: the listener script, several API processes.
+10. [Stage 6: the listener script](#10-stage-6-the-listener-script)
+11. [Stage 7: more than one API process](#11-stage-7-more-than-one-api-process)
 
 ---
 
@@ -597,3 +597,151 @@ The worker process now runs **two** BullMQ workers: `video-processing` (concurre
 | create an invitation | job `email-invitation-<id>` completed; email delivered |
 | Mailpit stopped, then `forgot-password` | 200 at once; attempts fail with `Connection timeout` after 10 s each, job `delayed`; after Mailpit is restarted, delivered on attempt 3, 35 s after the request |
 | before the timeout fix | attempt 1 hung for 69 s until Mailpit returned; no retry happened |
+
+
+---
+
+## 10. Stage 6: the listener script
+
+```bash
+cd backend
+KLYRO_EMAIL=you@example.com KLYRO_PASSWORD=… npm run socket:listen -- --club <clubId>
+```
+
+```text
+18:47:38  connected        ZbisYTGyen9fir7xAAAA
+18:47:38  joined           admin · rooms club:42c0…, club:42c0…:managers
+18:47:42  progress         69f44ce8  10%
+18:47:44  progress         69f44ce8  32%
+18:47:45  progress         69f44ce8  54%
+18:47:46  progress         69f44ce8  75%
+18:47:47  video:ready      69f44ce8  "s8 listener demo" · 12 s · 1280×720
+```
+
+It's the reference client: everything a browser frontend must do, in about 100 lines.
+
+### Rooms don't survive a reconnect
+
+When the connection drops (API restart, deploy, Wi-Fi switch), `socket.io-client` reconnects by itself. But the reconnected socket is a **new** socket on the server, with a new id and **no rooms**. So the join lives in the `connect` handler, which runs on the first connection **and every reconnection**:
+
+```ts
+socket.on('connect', () => {
+  say('connected', socket.id);
+  socket.emit('club:join', clubId, (result) => { ... });
+});
+```
+
+**Measured** by restarting the API under a running listener:
+
+```text
+18:47:55  connect error    websocket error      ← API is down; the client retries with backoff
+18:47:58  connect error    websocket error
+18:48:01  connect error    websocket error
+18:48:06  connected        kJvuqnGIJ9CR9fDRAAAA ← new socket id
+18:48:06  joined           admin · rooms club:42c0…, club:42c0…:managers
+```
+
+A client that joins once, outside `connect`, works perfectly until the first deploy and then goes silent forever. That bug wouldn't show up in any test that doesn't restart the server.
+
+### A token that changes, in a connection that doesn't
+
+```ts
+const socket: Socket<ServerToClientEvents, ClientToServerEvents> = io(values.api, {
+  auth: (send) => send({ token }),
+  transports: ['websocket'],
+});
+
+socket.on('auth:expired', () => {
+  freshToken().then((next) => {
+    token = next;
+    socket.connect();
+  });
+});
+```
+
+- **`auth` is a function,** called on every (re)connection, so each attempt sends the **current** token. A plain object would be captured once and resent unchanged forever.
+- **`auth:expired` → refresh → `connect()`.** The server's disconnect is deliberate, so the client doesn't reconnect by itself (section 3). `freshToken` uses the refresh cookie from login, the same `POST /auth/refresh` flow as `upload.ts`, and only logs in with the password again if that fails.
+- **`club:membership` with `role: null`** means you were removed: the script says so and exits.
+- **The same types as the server:** `Socket<ServerToClientEvents, ClientToServerEvents>` imports `realtime/events.ts`, so a renamed event breaks the script at compile time.
+
+---
+
+## 11. Stage 7: more than one API process
+
+A load balancer in front of two API processes sends each browser to one of them. Socket.io's rooms live **in memory, per process**. Without help, process A knows nothing about the sockets on process B.
+
+### Which features break, measured
+
+Your API on `:4000` plus a second instance on `:4001`, with an admin on each and a viewer on `:4001`:
+
+| Feature | Without the adapter | With the Redis adapter |
+|---|---|---|
+| `video:ready` / `video:progress` (relayed from queue events) | ✅ exactly once each | ✅ exactly once each |
+| Promote the viewer through `:4000` → `club:membership` on `:4001` | ❌ **never arrives** | ✅ arrives |
+
+Queue events already worked without the adapter: **every** API instance runs its own `QueueEvents`, reads the same Redis stream, and relays to its **own** sockets. Membership sync didn't: the PATCH lands on `:4000`, whose `fetchSockets()` can only see `:4000`'s sockets, so the viewer on `:4001` stays in the managers room.
+
+### What the adapter does
+
+`@socket.io/redis-adapter` connects all instances through Redis **pub/sub**. A broadcast on one instance is also published to Redis, and every other instance delivers it to its own matching sockets. `fetchSockets()` asks every instance and merges the answers, and `socket.join` / `leave` on a remote socket is sent to the instance that holds it.
+
+```mermaid
+flowchart LR
+    subgraph A["API :4000"]
+        SA["sockets: admin"]
+    end
+    subgraph B["API :4001"]
+        SB["sockets: admin, viewer"]
+    end
+    R[("Redis pub/sub<br/>socket.io#/#")]
+    A <--> R
+    B <--> R
+    P["PATCH /members/viewer (on :4000)"] --> A
+    A -- "fetchSockets(user:viewer) → ask every node" --> R
+    R --> B
+    B -- "viewer socket: join managers, emit club:membership" --> SB
+```
+
+```ts
+const adapterClient = (name: string) => {
+  const client = new Redis(env.REDIS_URL, { connectionName: `klyro:sockets-${name}` });
+  client.on('error', (err) => logger.error({ err, client: name }, 'socket adapter redis error'));
+  adapterClients.push(client);
+  return client;
+};
+
+new Server(httpServer, { ..., adapter: createAdapter(adapterClient('pub'), adapterClient('sub')) });
+```
+
+- **Two dedicated connections.** A Redis connection in subscribe mode can't run normal commands, so the adapter needs a publisher and a subscriber. Neither is the shared `redis` client, whose 2-second command timeout and lazy connect suit caching, not a subscription that must stay open. `connectionName` makes them recognizable in `CLIENT LIST`: with two APIs and a worker running there were `klyro:producer` ×3, `klyro:events` ×2, `klyro:sockets-pub` ×2, `klyro:sockets-sub` ×2 and `klyro:worker` ×1.
+- **Closed on shutdown,** after `io.close()`, so the process can exit.
+
+### The duplicate trap
+
+With the adapter on, `io.to(room).emit(...)` means "this room **on every instance**". But both instances run `QueueEvents` and both hear the same `completed`. If each broadcast to the whole cluster, every client would get the event once **per API instance**. **Measured** with two Socket.io servers sharing the adapter, each emitting once, as each API's relay does:
+
+```text
+both nodes: io.to(room).emit        (broadcast)   {"onA":2,"onB":2}
+both nodes: io.local.to(room).emit  (own sockets) {"onA":1,"onB":1}
+```
+
+That's why the relay uses `io.local` (decision 8): every instance hears every queue event, so each one only needs to cover its own sockets. Together they reach everyone exactly once. Membership sync is the opposite: only **one** instance handles the PATCH, so it must reach across the cluster, and that's what the adapter is for.
+
+| Who knows about the change? | Then emit with |
+|---|---|
+| **every** instance (queue events) | `io.local.to(room)` |
+| **one** instance (an HTTP request) | `io.to(room)` / `fetchSockets()` through the adapter |
+
+### What isn't covered
+
+- **Sticky sessions.** Long polling sends several HTTP requests per session, and they must all reach the same instance. Behind a real load balancer, either enable sticky sessions or allow only WebSockets (`transports: ['websocket']`), which use one long connection. The project runs without a load balancer, so this is noted, not built.
+- **Delivery during a Redis outage.** If Redis is down, cross-instance broadcasts and `fetchSockets()` fail (logged by `syncMembership`); local delivery still works.
+
+### What was tested
+
+| Case | Result |
+|---|---|
+| two API instances, no adapter: promote via `:4000`, viewer on `:4001` | no `club:membership` |
+| same, with the adapter | `club:membership { role: 'club_owner' }` on `:4001` |
+| one upload, admin on each instance + viewer on `:4001`, with and without the adapter | each client: exactly 1 `video:ready`; admins 4–6 progress each, viewer 0 |
+| two servers sharing the adapter, both emitting | `io.to` → 2 per client; `io.local.to` → 1 per client |
