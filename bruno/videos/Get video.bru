@@ -15,7 +15,7 @@ auth:bearer {
 }
 
 docs {
-  Any member of the video's club. Viewers only see READY videos; anything else, and videos in clubs you are not in, return 404 `VIDEO_NOT_FOUND`. `thumbnailUrl` is valid for 10 minutes and is `null` until the video is READY.
+  Any member of the video's club. Viewers only see READY videos; anything else, and videos in clubs you are not in, return 404 `VIDEO_NOT_FOUND`. `thumbnailUrl` is valid for 10 minutes and is `null` until the video is READY. `resolution` is the source's display size (rotation applied), recorded by the worker; it is `null` until the video is READY.
 
   Example response:
 
@@ -28,6 +28,7 @@ docs {
       "description": null,
       "status": "READY",
       "durationSeconds": 120,
+      "resolution": { "width": 1920, "height": 1080 },
       "sizeBytes": 297873717,
       "errorMessage": null,
       "uploader": { "id": "a5a3efa3-d269-41bf-b6da-187084ab047a", "email": "uploader@example.com" },

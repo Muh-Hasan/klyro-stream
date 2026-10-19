@@ -101,6 +101,8 @@ const produce = async (
     hlsPath: keys.hlsPath,
     thumbnailPath: keys.thumbnailPath,
     durationSeconds: Math.round(meta.durationSeconds),
+    width: meta.width,
+    height: meta.height,
   };
 };
 

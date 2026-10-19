@@ -143,6 +143,8 @@ export const videos = pgTable(
     hlsPath: text('hls_path'),
     thumbnailPath: text('thumbnail_path'),
     durationSeconds: integer('duration_seconds'),
+    width: integer('width'),
+    height: integer('height'),
     sizeBytes: bigint('size_bytes', { mode: 'number' }),
     errorMessage: text('error_message'),
     ...timestamps,

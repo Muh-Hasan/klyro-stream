@@ -14,7 +14,14 @@ const TRANSITIONS: Record<VideoStatus, readonly VideoStatus[]> = {
 export type VideoChanges = Partial<
   Pick<
     NewVideo,
-    'uploadId' | 'sizeBytes' | 'hlsPath' | 'thumbnailPath' | 'durationSeconds' | 'errorMessage'
+    | 'uploadId'
+    | 'sizeBytes'
+    | 'hlsPath'
+    | 'thumbnailPath'
+    | 'durationSeconds'
+    | 'width'
+    | 'height'
+    | 'errorMessage'
   >
 >;
 

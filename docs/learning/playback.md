@@ -317,10 +317,17 @@ The storage key (`thumbnailPath`) is taken out and replaced by a URL. Clients ne
 ## 7. Stages 2–3: one video, viewing and editing
 
 ```text
-GET   /videos/:videoId   → { video: { id, clubId, title, description, status, durationSeconds, sizeBytes,
-                                      errorMessage, uploader: { id, email }, thumbnailUrl, createdAt, updatedAt } }
+GET   /videos/:videoId   → { video: { id, clubId, title, description, status, durationSeconds,
+                                      resolution: { width, height } | null, sizeBytes, errorMessage,
+                                      uploader: { id, email }, thumbnailUrl, createdAt, updatedAt } }
 PATCH /videos/:videoId   { title?, description? } → same shape
 ```
+
+### Where `resolution` comes from
+
+The worker already runs `ffprobe` before transcoding (see [transcoding.md](transcoding.md)), and it swaps width and height for phone videos recorded sideways (rotation 90 or 270). It used to throw those numbers away. Migration `0003_video_resolution` adds nullable `width` and `height` columns, and the worker now returns them with the rest of its output, so `markVideoReady` saves them in the same `PROCESSING → READY` update.
+
+They're nullable because a video only has a resolution once it has been probed. The API returns `resolution: null` until then, rather than two loose nulls. The 5 real videos that existed before the migration were backfilled once by running `ffprobe` against a 2-minute presigned URL of each raw source. ffprobe reads only the file's header over HTTP, so nothing was downloaded in full. That was a one-off script, not app code.
 
 ### The authorization problem: the URL has no club in it
 

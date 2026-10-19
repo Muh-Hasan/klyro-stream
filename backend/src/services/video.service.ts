@@ -88,6 +88,7 @@ const toVideoResponse = async (video: VideoWithUploader) => ({
     description: video.description,
     status: video.status,
     durationSeconds: video.durationSeconds,
+    resolution: video.width && video.height ? { width: video.width, height: video.height } : null,
     sizeBytes: video.sizeBytes,
     errorMessage: video.errorMessage,
     uploader: video.uploader,

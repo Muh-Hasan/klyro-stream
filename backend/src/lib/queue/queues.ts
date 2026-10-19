@@ -11,6 +11,8 @@ export type TranscodeOutput = {
   hlsPath: string;
   thumbnailPath: string;
   durationSeconds: number;
+  width?: number;
+  height?: number;
 };
 
 export type TranscodeJob = {
