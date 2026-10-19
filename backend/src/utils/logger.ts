@@ -7,9 +7,18 @@
 import { pino } from 'pino';
 import { env } from '../config/env.js';
 
+export type ServiceName = 'api' | 'worker';
+
+let serviceName: ServiceName = 'api';
+
+export const setServiceName = (name: ServiceName) => {
+  serviceName = name;
+};
+
 export const logger = pino({
   level: env.LOG_LEVEL,
-  base: { service: 'klyro-api', env: env.NODE_ENV },
+  base: { env: env.NODE_ENV },
+  mixin: () => ({ service: serviceName }),
   timestamp: pino.stdTimeFunctions.isoTime,
   // Secrets never reach the logs, even if a whole request or user object is logged by mistake.
   redact: {

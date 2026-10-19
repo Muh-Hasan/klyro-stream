@@ -3,6 +3,7 @@ import { queueConnection } from '../lib/queue/connection.js';
 import { VIDEO_QUEUE, videoIdFromJobId } from '../lib/queue/queues.js';
 import * as videoRepo from '../repositories/video.repository.js';
 import { logger } from '../utils/logger.js';
+import { realtimeEvents } from './metrics.js';
 import { clubRoom, managersRoom, type RealtimeServer } from './rooms.js';
 
 export const PROGRESS_INTERVAL_MS = 1_000;
@@ -41,6 +42,7 @@ export const relayVideoEvents = (io: RealtimeServer) => {
     const clubId = await clubOf(videoId);
     if (!clubId) return;
     io.local.to(managersRoom(clubId)).emit('video:progress', { videoId, clubId, percent });
+    realtimeEvents.inc({ event: 'video:progress' });
   };
 
   const onCompleted = async (videoId: string) => {
@@ -54,6 +56,7 @@ export const relayVideoEvents = (io: RealtimeServer) => {
       durationSeconds: video.durationSeconds,
       resolution: video.width && video.height ? { width: video.width, height: video.height } : null,
     });
+    realtimeEvents.inc({ event: 'video:ready' });
   };
 
   const onFailed = async (videoId: string) => {
@@ -66,6 +69,7 @@ export const relayVideoEvents = (io: RealtimeServer) => {
       title: video.title,
       reason: video.errorMessage,
     });
+    realtimeEvents.inc({ event: 'video:failed' });
   };
 
   const relay = (event: string, jobId: string, work: (videoId: string) => Promise<void>) => {

@@ -4,12 +4,14 @@ import express, { type Express } from 'express';
 import helmet from 'helmet';
 import { env } from './config/env.js';
 import { errorHandler, notFoundHandler } from './middleware/error.middleware.js';
+import { metricsMiddleware } from './middleware/metrics.middleware.js';
 import { requestLogger } from './middleware/request-logger.middleware.js';
 import { routes } from './routes/index.js';
 
 export const createApp = (): Express => {
   const app = express();
 
+  app.use(metricsMiddleware);
   app.use(requestLogger);
   app.use(helmet());
   app.use(

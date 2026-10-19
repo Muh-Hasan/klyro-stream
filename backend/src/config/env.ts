@@ -16,6 +16,8 @@ const optional = <T extends z.ZodType>(type: T) =>
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
+  API_METRICS_PORT: z.coerce.number().int().positive().default(9465),
+  WORKER_METRICS_PORT: z.coerce.number().int().positive().default(9464),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 
   DATABASE_URL: z.url(),

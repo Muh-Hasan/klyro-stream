@@ -11,6 +11,8 @@ import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { closeDb } from './lib/db/client.js';
 import { closeQueueConnections } from './lib/queue/connection.js';
+import { initObservability } from './lib/metrics/registry.js';
+import { closeMetricsServer, startMetricsServer } from './lib/metrics/server.js';
 import { closeQueues } from './lib/queue/queues.js';
 import { closeRedis } from './lib/redis/client.js';
 import { closeRealtime, createRealtime } from './realtime/server.js';
@@ -19,12 +21,15 @@ import { logger } from './utils/logger.js';
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
+initObservability('api');
+
 const server: Server = createApp().listen(env.PORT, () => {
   logger.info({ port: env.PORT }, 'API listening');
 });
 
 const realtime = createRealtime(server);
 const videoEvents = relayVideoEvents(realtime);
+const metricsServer = startMetricsServer(env.API_METRICS_PORT);
 
 let shuttingDown = false;
 
@@ -45,6 +50,7 @@ const shutdown = async (reason: string, exitCode = 0) => {
 
   const results = await Promise.allSettled([
     Promise.allSettled([closeQueues(), videoEvents.close()]).finally(closeQueueConnections),
+    closeMetricsServer(metricsServer),
     closeDb(),
     closeRedis(),
   ]);
