@@ -54,7 +54,7 @@ Measured on a laptop: a 4K, 32 s clip (239 MB) transcodes in ~42 s; a 1080p, 2-m
 | Raise a club's download quota | `PATCH /admin/clubs/:clubId/quota` with the Bull Board credentials (Bruno: admin → Set club quota) |
 | API requests | the Bruno collection in `bruno/` ([guide](docs/bruno.md)) |
 
-How it works: [uploads](docs/learning/uploads.md) · [job queues and workers](docs/learning/queues.md) · [transcoding and HLS](docs/learning/transcoding.md) · [library, playback and downloads](docs/learning/playback.md) · [real-time events and email](docs/learning/realtime.md) · [observability](docs/learning/observability.md) · [monitoring guide](docs/learning/monitoring-guide.md) · [transactions](docs/learning/transactions.md) · [locking](docs/learning/locking.md) · [indexes](docs/learning/indexes.md)
+How it works (**start with the [study roadmap](docs/learning/README.md)**): [uploads](docs/learning/uploads.md) · [job queues and workers](docs/learning/queues.md) · [transcoding and HLS](docs/learning/transcoding.md) · [library, playback and downloads](docs/learning/playback.md) · [real-time events and email](docs/learning/realtime.md) · [observability](docs/learning/observability.md) · [monitoring guide](docs/learning/monitoring-guide.md) · [transactions](docs/learning/transactions.md) · [locking](docs/learning/locking.md) · [indexes](docs/learning/indexes.md)
 
 ## Monitoring
 
