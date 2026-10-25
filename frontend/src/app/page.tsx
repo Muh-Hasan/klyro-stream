@@ -7,10 +7,10 @@ export default function Home() {
       <h1 className="text-4xl font-semibold tracking-tight sm:text-5xl">KlyroStream</h1>
       <div className="flex gap-3">
         <Button variant="outline" size="lg" asChild>
-          <Link href="/login">Log in</Link>
+          <Link href="/auth/login">Log in</Link>
         </Button>
         <Button size="lg" asChild>
-          <Link href="/register">Sign up</Link>
+          <Link href="/auth/register">Sign up</Link>
         </Button>
       </div>
     </main>
