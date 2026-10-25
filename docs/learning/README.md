@@ -210,6 +210,8 @@ The most important phase: correctness under concurrency.
 | JWT access + refresh tokens, rotation, reuse detection | [§8.2](#82-authentication-and-sessions) | `services/auth.service.ts`, `utils/tokens.ts`, `repositories/token-blacklist.repository.ts` |
 | Rate limiting | [§8.2](#82-authentication-and-sessions), playback.md §11 | `middleware/rate-limit.middleware.ts` |
 | Google OAuth (PKCE + state) | [§8.2](#82-authentication-and-sessions) | `middleware/google-auth.middleware.ts`, `utils/oauth-state.ts` |
+| Tokens in the browser, single-flight refresh, multi-tab locks | client-auth.md | `frontend/src/lib/auth/` (Sprint 10) |
+| CORS preflight, `SameSite` and same-site deployment | client-auth.md §6–7 | `app.ts` (`cors`), `utils/cookies.ts` |
 | Roles (viewer / club_owner / admin) | [§8.3](#83-clubs-roles-and-invitations), playback.md §7 | `middleware/require-club-role.middleware.ts`, `utils/roles.ts` |
 | Invitations with hashed tokens | [§8.3](#83-clubs-roles-and-invitations), locking.md §2 | `services/invitation.service.ts`, `repositories/invitation.repository.ts` |
 | Transactions, isolation, MVCC | transactions.md | `lib/db/client.ts`, repositories |
@@ -262,7 +264,8 @@ git diff <first-commit>~1 <last-commit> --stat   # the size of a whole sprint
 | S7 | Library, streaming, downloads, quotas | playback.md |
 | S8 | Socket.io events, email queue, multi-instance | realtime.md |
 | S9 | Metrics, logs, dashboards, alerts | observability.md, monitoring-guide.md |
-| S10–S12 | Frontend demo, polish, AI captions | not started |
+| S10 | Frontend (Next.js + shadcn) | in progress: client-auth.md |
+| S11–S12 | Polish, AI captions | not started |
 
 ## 8. The missing pieces, part 1: built but not yet explained
 
